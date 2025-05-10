@@ -3,7 +3,7 @@ import requests
 from exception.exceptions import TradingBotException
 import sys
 
-BASE_URL = "http://localhost:8003"  # Backend endpoint
+BASE_URL = "http://localhost:8000"  # Backend endpoint
 
 st.set_page_config(
     page_title="📈 Stock Market Agentic Chatbot",

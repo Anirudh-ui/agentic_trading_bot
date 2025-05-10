@@ -9,7 +9,7 @@ PINECONE_API_KEY
 
 ### for running the fastapi endpoint
 ```
-uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ```
 
@@ -38,3 +38,10 @@ conda activate <env_path>
 ```
 source activate ./env
 ```
+
+## Next step
+1. mention logger and exception
+2. capture the logging and exception messages
+3. if possible run the langgraph workflow in ipynb and test the real time data fetching tool
+4. deploy it
+5. sit on it either thu or friday

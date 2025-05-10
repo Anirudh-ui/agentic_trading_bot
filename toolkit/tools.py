@@ -10,10 +10,10 @@ from utils.model_loaders import ModelLoader
 from utils.config_loader import load_config
 from dotenv import load_dotenv
 from pinecone import Pinecone
+load_dotenv()
 api_wrapper = PolygonAPIWrapper()
 model_loader=ModelLoader()
 config = load_config()
-load_dotenv()
 
 @tool(args_schema=RagToolSchema)
 def retriever_tool(question):
