@@ -4,6 +4,9 @@ vector_db:
 retriever:
   top_k: 3
   score_threshold: 0.5
+  use_mmr: true  # Use Maximum Marginal Relevance
+  fetch_k: 20    # Fetch more candidates for MMR
+  lambda_mult: 0.7  # Balance relevance (1.0) vs diversity (0.0)
 
 embedding_model:
   provider: "google"
@@ -13,11 +16,57 @@ llm:
   google:
     provider: "google"
     model_name: "gemini-1.5-pro"
+    max_retries: 3
+    retry_min_wait: 2
+    retry_max_wait: 10
   groq:
     provider: "groq"
-    model_name: "deepseek-r1-distill-llama-70b"
+    model_name: "qwen/qwen3-32b"
+    max_retries: 3
+    retry_min_wait: 2
+    retry_max_wait: 10
 
 tools:
   tavily:
-    max_results: 5
+    max_results: 3
+    search_depth: "basic"
+  
+  yahoo_finance:
+    enabled: true
+    cache_ttl: 300  # 5 minutes for stock prices
 
+# CAG (Corrective-RAG) Configuration
+cag:
+  enabled: true
+  relevance_threshold: 0.5  # Minimum relevance score to accept RAG results
+  use_mmr: true  # Use MMR for document ranking
+  correction_strategy: "web_search"  # What to do when RAG fails
+  
+  # Metrics
+  track_metrics: true
+  log_corrections: true
+
+# Caching configuration
+cache:
+  enabled: true
+  response_cache_ttl: 1800      # 30 minutes
+  tool_cache_ttl: 3600           # 1 hour for general tools
+  stock_cache_ttl: 300           # 5 minutes for stock data (more frequent updates)
+
+# Smart routing configuration
+routing:
+  enabled: true
+  classification_cache_size: 1000  # Cache query classifications
+  
+  # Priority order for tool selection
+  tool_priority:
+    stock: "yahoo_finance_tool"
+    general: "tavilytool"
+    knowledge: "retriever_tool"
+
+# Performance monitoring
+monitoring:
+  enabled: true
+  log_interval: 300
+  track_tool_usage: true
+  track_relevance_scores: true

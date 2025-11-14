@@ -11,4 +11,9 @@ langchain-pinecone
 pypdf
 pyyaml
 requests
+yfinance>=0.2.40
+tenacity>=8.2.0
+scikit-learn>=1.3.0
+langchain_groq
+langchain-tavily
 -e .
