@@ -9,4 +9,6 @@ fastapi[all]
 uvicorn
 langchain-pinecone
 pypdf
+pyyaml
+requests
 -e .
