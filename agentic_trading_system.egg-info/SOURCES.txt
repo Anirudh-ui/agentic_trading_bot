@@ -9,6 +9,8 @@ agentic_trading_system.egg-info/requires.txt
 agentic_trading_system.egg-info/top_level.txt
 custom_logging/__init__.py
 custom_logging/my_logger.py
+data_ingestion/__init__.py
+data_ingestion/ingestion_pipeline.py
 data_models/__init__.py
 data_models/models.py
 exception/__init__.py
