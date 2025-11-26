@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# Dependencies
+/node_modules
+/target
+
+# Logs and Data
+*.log
+/data_files
+/tmp
+/upload_files
+
+# Docker
+*.zip
+*.tar
+# Docker volumes usually live outside the project, but exclude any local volume data
+# you might have accidentally created inside the root folder

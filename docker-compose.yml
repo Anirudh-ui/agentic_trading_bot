@@ -1,0 +1,91 @@
+version: '3.8'
+
+services:
+  # Redis - Short-term memory storage
+  redis:
+    image: redis:7-alpine
+    container_name: trading-bot-redis
+    # Host Port : Container Internal Port
+    ports:
+      - "6380:6379" 
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - trading-bot-network
+
+  # Weaviate - Long-term memory storage
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.34.0 #1.26.1
+    container_name: trading-bot-weaviate
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: ''
+      CLUSTER_HOSTNAME: 'node1'
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - trading-bot-network
+      
+  # 🟢 Application Service for your Python Code (main.py)
+  app:
+    build: . 
+    container_name: trading-bot-app
+    ports:
+      - "8000:8000" 
+    environment:
+      # CRITICAL: Use the internal network address!
+      # Service Name: 'redis', Internal Port: 6379
+      REDIS_HOST: redis           
+      REDIS_PORT: 6379            
+      WEAVIATE_URL: http://weaviate:8080  
+      WEAVIATE_API_KEY: ''        
+    volumes:
+      - .:/app 
+    networks:
+      - trading-bot-network
+    depends_on:
+      redis:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+
+  # Optional: Redis Commander - Redis Web UI
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: trading-bot-redis-ui
+    environment:
+      # FIX: Redis Commander must access Redis using the service name and internal port (6379)
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - trading-bot-network
+
+volumes:
+  redis_data:
+    driver: local
+  weaviate_data:
+    driver: local
+
+networks:
+  trading-bot-network:
+    driver: bridge
