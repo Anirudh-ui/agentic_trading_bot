@@ -5,13 +5,10 @@ from agent.workflow_with_memory import GraphBuilder
 from langchain_core.messages import HumanMessage
 from data_ingestion.ingestion_pipeline import DataIngestion
 from exception.exceptions import TradingBotException
-from langchain_core.documents import Document
-from datetime import datetime
 import sys
 from typing import List
 import os
 import json
-
 from fastapi.responses import JSONResponse
 app = FastAPI(title="Stock Market Agentic Chatbot API")
 
@@ -153,36 +150,14 @@ async def query_bot(request: QueryModel):
         raise TradingBotException(e, sys)
 
 
-@app.post("/upload", response_model=List[Document])
+@app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
-    processed_documents = []
     try:
-        # Assuming DataIngestion() handles the RAG indexing (Weaviate/Vector Store)
         ingestion = DataIngestion()
-        
-        # NOTE: You'll need to modify DataIngestion.run_pipeline 
-        # to return the metadata of the files it successfully indexed.
-        
-        # --- SIMULATED/PLACEHOLDER LOGIC FOR DEMO ---
-        for file in files:
-            # Run the ingestion pipeline for the file
-            ingestion.run_pipeline([file]) # Assuming ingestion takes a list
-            
-            # Create the metadata to return to the frontend
-            doc_metadata = {
-                "id": file.filename,  # Use filename as a unique ID for simplicity
-                "name": file.filename,
-                "uploadedAt": datetime.now().isoformat(), # ISO format for JS Date parsing
-                "size": f"{file.size / 1024:.1f} KB",
-            }
-            processed_documents.append(doc_metadata)
-
-        # --- END SIMULATED LOGIC ---
-        
-        return processed_documents
+        ingestion.run_pipeline(files)
+        return {"message": "Files successfully processed and stored."}
     except Exception as e:
-        # Proper error handling
-        raise HTTPException(status_code=500, detail=f"File processing failed: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/clear-session")

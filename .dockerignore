@@ -1,0 +1,17 @@
+# Ignore local Python environment
+.venv
+venv
+__pycache__
+
+# Ignore development data and temporary files
+*.pyc
+*.log
+.DS_Store
+.vscode/
+
+# Ignore large data directories
+/data_files
+/notebooks
+
+# Ignore the Streamlit cache directory
+.streamlit

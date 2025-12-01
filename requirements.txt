@@ -22,4 +22,5 @@ langgraph[redis]
 transformers
 weaviate
 weaviate-client
+python-dateutil
 -e .

@@ -7,15 +7,30 @@ venv/
 # Dependencies
 /node_modules
 /target
-
+/.venv
+node_modules/
 # Logs and Data
 *.log
 /data_files
 /tmp
 /upload_files
-
+# Logs
+npm-debug.log*
+.npm 
 # Docker
 *.zip
 *.tar
+.DS_Store
+/node_modules
+/npm-debug.log*
+/yarn-error.log*
+/package-lock.json # <-- If you want to ignore this too, though often kept for dependency locking
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
 # Docker volumes usually live outside the project, but exclude any local volume data
 # you might have accidentally created inside the root folder
