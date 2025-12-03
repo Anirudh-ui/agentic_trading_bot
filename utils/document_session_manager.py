@@ -1,68 +1,37 @@
 """
-Document Session Manager
-Path: utils/document_session_manager.py
-
-Handles document-specific chat sessions with Redis (STM) and Weaviate (LTM)
+Enhanced Document Session Manager
+- Document registration and metadata management
+- Session tracking (STM + LTM)
+- Conversation history retrieval
+- Duplicate document detection
+- Comprehensive logging and error handling
 """
 
 import json
-from typing import List, Dict, Optional, Any
-from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Optional
+from datetime import datetime, timezone
 import hashlib
-from pathlib import Path
-
-# Import from your existing memory_manager
-from utils.memory_manager import RedisMemoryManager, WeaviateMemoryManager
-from custom_logging.my_logger import logger
-from exception.exceptions import TradingBotException
 import sys
 
+from utils.memory_manager import RedisMemoryManager, WeaviateMemoryManager
 from weaviate.classes.config import Property, DataType
 from weaviate.classes.query import Filter
-
-
-class DocumentMetadata:
-    """Document metadata structure"""
-    
-    def __init__(
-        self,
-        doc_id: str,
-        filename: str,
-        file_type: str,
-        upload_timestamp: str,
-        page_count: int = 0,
-        is_ocr: bool = False,
-        processing_status: str = "pending"
-    ):
-        self.doc_id = doc_id
-        self.filename = filename
-        self.file_type = file_type
-        self.upload_timestamp = upload_timestamp
-        self.page_count = page_count
-        self.is_ocr = is_ocr
-        self.processing_status = processing_status
-    
-    def to_dict(self) -> Dict:
-        return {
-            'doc_id': self.doc_id,
-            'filename': self.filename,
-            'file_type': self.file_type,
-            'upload_timestamp': self.upload_timestamp,
-            'page_count': self.page_count,
-            'is_ocr': self.is_ocr,
-            'processing_status': self.processing_status
-        }
-    
-    @classmethod
-    def from_dict(cls, data: Dict):
-        return cls(**data)
+from custom_logging.my_logger import logger, log_execution_time
+from exception.exceptions import (
+    TradingBotException,
+    SessionException,
+    ValidationException
+)
 
 
 class DocumentSessionManager:
     """
-    Manages document-specific chat sessions
-    - Redis: Active document sessions and recent Q&A
-    - Weaviate: Long-term document analysis history
+    Manages document sessions with enhanced features:
+    - Document metadata (Weaviate LTM)
+    - Session management (Redis STM)
+    - Q&A history (Weaviate LTM)
+    - Duplicate prevention
+    - Conversation summaries
     """
     
     def __init__(
@@ -70,94 +39,146 @@ class DocumentSessionManager:
         redis_host: str = 'localhost',
         redis_port: int = 6380,
         weaviate_url: str = 'http://localhost:8080',
-        weaviate_api_key: Optional[str] = None,
-        session_ttl_hours: int = 48
+        weaviate_api_key: Optional[str] = None
     ):
-        logger.info("Initializing Document Session Manager...")
+        """
+        Initialize document session manager
         
-        # Initialize Redis for short-term memory
-        self.redis_manager = RedisMemoryManager(
-            host=redis_host,
-            port=redis_port,
-            ttl_hours=session_ttl_hours
-        )
-        
-        # Initialize Weaviate for long-term memory
-        self.weaviate_manager = WeaviateMemoryManager(
-            url=weaviate_url,
-            api_key=weaviate_api_key
-        )
-        
-        # Setup document-specific schema
-        self._setup_document_schema()
-        
-        logger.info("Document Session Manager initialized")
-    
-    def _setup_document_schema(self):
-        """Setup Weaviate schema for document sessions"""
+        Args:
+            redis_host: Redis host for STM
+            redis_port: Redis port
+            weaviate_url: Weaviate URL for LTM
+            weaviate_api_key: Optional Weaviate API key
+        """
         try:
-            # Document metadata collection
-            if not self.weaviate_manager.client.collections.exists("DocumentMetadata"):
-                self.weaviate_manager.client.collections.create(
+            logger.info("[SESSION MANAGER] Initializing...")
+            
+            # Redis for short-term memory
+            self.redis_manager = RedisMemoryManager(
+                host=redis_host,
+                port=redis_port,
+                ttl_hours=48
+            )
+            logger.info("[SESSION MANAGER] Redis connected")
+            
+            # Weaviate for long-term memory
+            self.weaviate_manager = WeaviateMemoryManager(
+                url=weaviate_url,
+                api_key=weaviate_api_key
+            )
+            logger.info("[SESSION MANAGER] Weaviate connected")
+            
+            # Setup schemas
+            self._setup_schema()
+            
+            logger.info("[SESSION MANAGER] Initialization complete")
+            
+        except Exception as e:
+            logger.error(f"[SESSION MANAGER] Initialization failed: {e}")
+            raise SessionException(
+                "Failed to initialize session manager",
+                sys,
+                component="initialization"
+            )
+    
+    def _setup_schema(self):
+        """Setup Weaviate collections for document management"""
+        try:
+            client = self.weaviate_manager.client
+            
+            # Collection 1: DocumentMetadata
+            if not client.collections.exists("DocumentMetadata"):
+                client.collections.create(
                     name="DocumentMetadata",
                     properties=[
                         Property(name="doc_id", data_type=DataType.TEXT, description="Unique document ID"),
                         Property(name="filename", data_type=DataType.TEXT, description="Original filename"),
-                        Property(name="file_type", data_type=DataType.TEXT, description="File type (pdf, docx, image)"),
+                        Property(name="filename_hash", data_type=DataType.TEXT, description="Hash for duplicate detection"),
+                        Property(name="file_type", data_type=DataType.TEXT, description="File type (pdf, docx, etc)"),
                         Property(name="upload_timestamp", data_type=DataType.DATE, description="Upload time"),
                         Property(name="page_count", data_type=DataType.INT, description="Number of pages"),
-                        Property(name="is_ocr", data_type=DataType.BOOL, description="Was OCR used"),
-                        Property(name="processing_status", data_type=DataType.TEXT, description="Processing status"),
-                        Property(name="user_id", data_type=DataType.TEXT, description="Owner user ID"),
-                        Property(name="tags", data_type=DataType.TEXT_ARRAY, description="Document tags"),
+                        Property(name="user_id", data_type=DataType.TEXT, description="User ID"),
+                        Property(name="has_tables", data_type=DataType.BOOL, description="Contains tables"),
+                        Property(name="has_charts", data_type=DataType.BOOL, description="Contains charts"),
                     ]
                 )
+                logger.info("[SCHEMA] DocumentMetadata collection created")
             
-            # Document Q&A history collection
-            if not self.weaviate_manager.client.collections.exists("DocumentQA"):
-                self.weaviate_manager.client.collections.create(
+            # Collection 2: DocumentQA
+            if not client.collections.exists("DocumentQA"):
+                client.collections.create(
                     name="DocumentQA",
                     properties=[
-                        Property(name="doc_id", data_type=DataType.TEXT, description="Associated document ID"),
+                        Property(name="doc_id", data_type=DataType.TEXT, description="Document ID"),
                         Property(name="session_id", data_type=DataType.TEXT, description="Session ID"),
                         Property(name="user_id", data_type=DataType.TEXT, description="User ID"),
                         Property(name="question", data_type=DataType.TEXT, description="User question"),
-                        Property(name="answer", data_type=DataType.TEXT, description="Bot answer"),
+                        Property(name="answer", data_type=DataType.TEXT, description="Generated answer"),
                         Property(name="timestamp", data_type=DataType.DATE, description="Q&A timestamp"),
-                        Property(name="relevance_score", data_type=DataType.NUMBER, description="Answer relevance"),
-                        Property(name="sources", data_type=DataType.TEXT, description="Source pages/sections as JSON"),
+                        Property(name="sources", data_type=DataType.TEXT, description="Source citations (JSON)"),
                     ]
                 )
+                logger.info("[SCHEMA] DocumentQA collection created")
             
-            logger.info("Document schema setup complete")
+            logger.info("[SCHEMA] All collections verified/created")
             
         except Exception as e:
-            logger.error(f"Document schema setup failed: {e}")
-            raise TradingBotException(e, sys)
+            logger.error(f"[SCHEMA] Setup failed: {e}")
+            raise SessionException(
+                "Failed to setup Weaviate schema",
+                sys,
+                component="schema"
+            )
     
-    # ==================== Document Management ====================
-    
+    @log_execution_time
     def register_document(
         self,
         filename: str,
         file_type: str,
         user_id: str,
         page_count: int = 0,
-        is_ocr: bool = False,
-        tags: List[str] = None
+        has_tables: bool = False,
+        has_charts: bool = False
     ) -> str:
         """
-        Register a new document in the system
+        Register new document in Weaviate
+        
+        Args:
+            filename: Original filename
+            file_type: File extension (pdf, docx, etc)
+            user_id: User ID
+            page_count: Number of pages
+            has_tables: Whether document has tables
+            has_charts: Whether document has charts
         
         Returns:
-            doc_id: Unique document identifier
+            Generated document ID (format: trade_doc_{hash})
         """
         try:
-            # Generate unique doc_id
-            doc_id = self._generate_doc_id(filename, user_id)
+            # Validate inputs
+            if not filename or not filename.strip():
+                raise ValidationException(
+                    "Filename cannot be empty",
+                    sys,
+                    filename=filename
+                )
             
+            if not user_id or not user_id.strip():
+                raise ValidationException(
+                    "User ID cannot be empty",
+                    sys,
+                    user_id=user_id
+                )
+            
+            # Generate unique document ID
+            doc_id = f"trade_doc_{self._generate_hash(filename, user_id)}"
+            filename_hash = self._hash_filename(filename)
+            
+            # Create timestamp
             now_utc = datetime.now(timezone.utc)
-            timestamp_string = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            timestamp = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            
+            logger.info(f"[REGISTER] Registering document: {doc_id}")
             
             # Store in Weaviate
             collection = self.weaviate_manager.client.collections.get("DocumentMetadata")
@@ -166,82 +187,93 @@ class DocumentSessionManager:
                 properties={
                     "doc_id": doc_id,
                     "filename": filename,
+                    "filename_hash": filename_hash,
                     "file_type": file_type,
-                    "upload_timestamp": timestamp_string,
+                    "upload_timestamp": timestamp,
                     "page_count": page_count,
-                    "is_ocr": is_ocr,
-                    "processing_status": "completed",
                     "user_id": user_id,
-                    "tags": tags or []
+                    "has_tables": has_tables,
+                    "has_charts": has_charts
                 }
             )
             
-            # Store in Redis for quick access
-            redis_key = f"document:{doc_id}"
-            doc_data = {
-                'doc_id': doc_id,
-                'filename': filename,
-                'file_type': file_type,
-                'upload_timestamp': timestamp_string,
-                'page_count': page_count,
-                'is_ocr': is_ocr,
-                'user_id': user_id
-            }
-            self.redis_manager.redis_client.set(
-                redis_key,
-                json.dumps(doc_data),
-                ex=172800  # 48 hours
-            )
-            
-            logger.info(f"Registered document: {doc_id} - {filename}")
+            logger.info(f"[REGISTER] Document registered: {doc_id} | Pages: {page_count}")
             
             return doc_id
             
+        except ValidationException:
+            raise
         except Exception as e:
-            logger.error(f"Document registration failed: {e}")
-            raise TradingBotException(e, sys)
+            logger.error(f"[REGISTER] Failed: {e}")
+            raise SessionException(
+                "Failed to register document",
+                sys,
+                filename=filename,
+                user_id=user_id
+            )
     
-    def get_user_documents(self, user_id: str, limit: int = 50) -> List[Dict]:
-        """Get all documents for a user"""
+    @log_execution_time
+    def find_document_by_filename(
+        self,
+        filename: str,
+        user_id: str
+    ) -> Optional[Dict]:
+        """
+        Find existing document by filename (duplicate detection)
+        
+        Args:
+            filename: Original filename
+            user_id: User ID
+        
+        Returns:
+            Document metadata dict or None
+        """
         try:
+            filename_hash = self._hash_filename(filename)
+            
+            logger.info(f"[FIND DOC] Searching for: {filename}")
+            
             collection = self.weaviate_manager.client.collections.get("DocumentMetadata")
             
             response = collection.query.fetch_objects(
-                filters=Filter.by_property("user_id").equal(user_id),
-                limit=limit
+                filters=Filter.by_property("filename_hash").equal(filename_hash),
+                limit=1
             )
             
-            documents = []
-            for item in response.objects:
-                documents.append({
-                    'doc_id': item.properties.get('doc_id'),
-                    'filename': item.properties.get('filename'),
-                    'file_type': item.properties.get('file_type'),
-                    'upload_timestamp': item.properties.get('upload_timestamp'),
-                    'page_count': item.properties.get('page_count'),
-                    'is_ocr': item.properties.get('is_ocr'),
-                    'processing_status': item.properties.get('processing_status')
-                })
+            if response.objects:
+                props = response.objects[0].properties
+                logger.info(f"[FIND DOC] Found existing: {props.get('doc_id')}")
+                
+                return {
+                    'doc_id': props.get('doc_id'),
+                    'filename': props.get('filename'),
+                    'upload_timestamp': props.get('upload_timestamp'),
+                    'page_count': props.get('page_count'),
+                    'has_tables': props.get('has_tables'),
+                    'has_charts': props.get('has_charts')
+                }
             
-            logger.info(f"Retrieved {len(documents)} documents for user {user_id}")
-            
-            return documents
+            logger.info(f"[FIND DOC] Not found: {filename}")
+            return None
             
         except Exception as e:
-            logger.error(f"Failed to get user documents: {e}")
-            return []
+            logger.error(f"[FIND DOC] Error: {e}")
+            return None
     
+    @log_execution_time
     def get_document_metadata(self, doc_id: str) -> Optional[Dict]:
-        """Get metadata for a specific document"""
+        """
+        Get document metadata
+        
+        Args:
+            doc_id: Document ID
+        
+        Returns:
+            Document metadata or None
+        """
         try:
-            # Try Redis first (faster)
-            redis_key = f"document:{doc_id}"
-            cached_data = self.redis_manager.redis_client.get(redis_key)
+            logger.info(f"[GET METADATA] Doc: {doc_id}")
             
-            if cached_data:
-                return json.loads(cached_data)
-            
-            # Fallback to Weaviate
             collection = self.weaviate_manager.client.collections.get("DocumentMetadata")
             
             response = collection.query.fetch_objects(
@@ -257,56 +289,57 @@ class DocumentSessionManager:
                     'file_type': props.get('file_type'),
                     'upload_timestamp': props.get('upload_timestamp'),
                     'page_count': props.get('page_count'),
-                    'is_ocr': props.get('is_ocr')
+                    'has_tables': props.get('has_tables'),
+                    'has_charts': props.get('has_charts')
                 }
             
             return None
             
         except Exception as e:
-            logger.error(f"Failed to get document metadata: {e}")
+            logger.error(f"[GET METADATA] Error: {e}")
             return None
     
-    # ==================== Session Management ====================
-    
-    def create_document_session(
-        self,
-        doc_id: str,
-        user_id: str
-    ) -> str:
+    @log_execution_time
+    def get_user_documents(self, user_id: str, limit: int = 50) -> List[Dict]:
         """
-        Create a new document chat session
+        Get all documents for user
+        
+        Args:
+            user_id: User ID
+            limit: Maximum documents to return
         
         Returns:
-            session_id: Unique session identifier
+            List of document metadata
         """
         try:
-            session_id = f"doc_{doc_id}_{user_id}_{int(datetime.now().timestamp())}"
+            logger.info(f"[GET USER DOCS] User: {user_id} | Limit: {limit}")
             
-            # Initialize session in Redis
-            session_key = f"doc_session:{session_id}"
-            session_data = {
-                'session_id': session_id,
-                'doc_id': doc_id,
-                'user_id': user_id,
-                'created_at': datetime.now().isoformat(),
-                'message_count': 0,
-                'active_document': doc_id
-            }
+            collection = self.weaviate_manager.client.collections.get("DocumentMetadata")
             
-            self.redis_manager.redis_client.set(
-                session_key,
-                json.dumps(session_data),
-                ex=172800  # 48 hours
+            response = collection.query.fetch_objects(
+                filters=Filter.by_property("user_id").equal(user_id),
+                limit=limit
             )
             
-            logger.info(f"Created document session: {session_id}")
+            documents = []
+            for item in response.objects:
+                documents.append({
+                    'doc_id': item.properties.get('doc_id'),
+                    'filename': item.properties.get('filename'),
+                    'file_type': item.properties.get('file_type'),
+                    'upload_timestamp': item.properties.get('upload_timestamp'),
+                    'page_count': item.properties.get('page_count')
+                })
             
-            return session_id
+            logger.info(f"[GET USER DOCS] Found {len(documents)} documents")
+            
+            return documents
             
         except Exception as e:
-            logger.error(f"Session creation failed: {e}")
-            raise TradingBotException(e, sys)
+            logger.error(f"[GET USER DOCS] Error: {e}")
+            return []
     
+    @log_execution_time
     def store_document_qa(
         self,
         session_id: str,
@@ -314,26 +347,24 @@ class DocumentSessionManager:
         user_id: str,
         question: str,
         answer: str,
-        relevance_score: float = 0.0,
         sources: List[Dict] = None
     ):
-        """Store Q&A interaction for a document"""
+        """
+        Store Q&A interaction in Weaviate LTM
+        
+        Args:
+            session_id: Session ID
+            doc_id: Document ID
+            user_id: User ID
+            question: User question
+            answer: Generated answer
+            sources: Source citations
+        """
         try:
-            # Store in Redis (short-term)
-            qa_key = f"doc_qa:{session_id}"
-            qa_entry = {
-                'question': question,
-                'answer': answer,
-                'timestamp': datetime.now().isoformat(),
-                'relevance_score': relevance_score
-            }
-            
-            self.redis_manager.redis_client.rpush(qa_key, json.dumps(qa_entry))
-            self.redis_manager.redis_client.expire(qa_key, 172800)
-            
-            # Store in Weaviate (long-term)
             now_utc = datetime.now(timezone.utc)
-            timestamp_string = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            timestamp = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+            
+            logger.info(f"[STORE Q&A] Doc: {doc_id} | Session: {session_id}")
             
             collection = self.weaviate_manager.client.collections.get("DocumentQA")
             
@@ -344,24 +375,32 @@ class DocumentSessionManager:
                     "user_id": user_id,
                     "question": question,
                     "answer": answer,
-                    "timestamp": timestamp_string,
-                    "relevance_score": relevance_score,
+                    "timestamp": timestamp,
                     "sources": json.dumps(sources or [])
                 }
             )
             
-            logger.info(f"Stored Q&A for document {doc_id}")
+            logger.info(f"[STORE Q&A] Stored successfully")
             
         except Exception as e:
-            logger.error(f"Failed to store document Q&A: {e}")
+            logger.error(f"[STORE Q&A] Error: {e}")
+            # Don't raise - Q&A storage is non-critical
     
-    def get_document_qa_history(
-        self,
-        doc_id: str,
-        limit: int = 10
-    ) -> List[Dict]:
-        """Get Q&A history for a document"""
+    @log_execution_time
+    def get_document_summary(self, doc_id: str, limit: int = 5) -> Optional[str]:
+        """
+        Get conversation summary for document
+        
+        Args:
+            doc_id: Document ID
+            limit: Number of recent Q&As to include
+        
+        Returns:
+            Summary string or None
+        """
         try:
+            logger.info(f"[GET SUMMARY] Doc: {doc_id}")
+            
             collection = self.weaviate_manager.client.collections.get("DocumentQA")
             
             response = collection.query.fetch_objects(
@@ -369,98 +408,88 @@ class DocumentSessionManager:
                 limit=limit
             )
             
-            qa_history = []
-            for item in response.objects:
-                qa_history.append({
-                    'question': item.properties.get('question'),
-                    'answer': item.properties.get('answer'),
-                    'timestamp': item.properties.get('timestamp'),
-                    'relevance_score': item.properties.get('relevance_score')
-                })
+            if response.objects:
+                summary = f"Recent conversations with this document ({len(response.objects)} Q&As):\n\n"
+                
+                for i, item in enumerate(response.objects, 1):
+                    q = item.properties.get('question', '')[:60]
+                    timestamp = item.properties.get('timestamp', '')
+                    summary += f"{i}. {q}... (at {timestamp[:10]})\n"
+                
+                logger.info(f"[GET SUMMARY] Generated summary with {len(response.objects)} Q&As")
+                
+                return summary
             
-            return qa_history
-            
-        except Exception as e:
-            logger.error(f"Failed to get Q&A history: {e}")
-            return []
-    
-    def set_active_document(self, session_id: str, doc_id: str):
-        """Set the active document for a session"""
-        try:
-            session_key = f"active_doc:{session_id}"
-            self.redis_manager.redis_client.set(
-                session_key,
-                doc_id,
-                ex=172800
-            )
-            logger.info(f"Set active document: {doc_id} for session {session_id}")
+            return None
             
         except Exception as e:
-            logger.error(f"Failed to set active document: {e}")
-    
-    def get_active_document(self, session_id: str) -> Optional[str]:
-        """Get the currently active document for a session"""
-        try:
-            session_key = f"active_doc:{session_id}"
-            doc_id = self.redis_manager.redis_client.get(session_key)
-            return doc_id
-            
-        except Exception as e:
-            logger.error(f"Failed to get active document: {e}")
+            logger.error(f"[GET SUMMARY] Error: {e}")
             return None
     
-    # ==================== Utility Methods ====================
-    
-    def _generate_doc_id(self, filename: str, user_id: str) -> str:
-        """Generate unique document ID"""
-        timestamp = datetime.now().isoformat()
-        hash_input = f"{filename}_{user_id}_{timestamp}"
-        return hashlib.md5(hash_input.encode()).hexdigest()[:16]
-    
-    def search_document_qa(
-        self,
-        query: str,
-        doc_id: Optional[str] = None,
-        limit: int = 5
-    ) -> List[Dict]:
-        """Search through document Q&A history"""
+    @log_execution_time
+    def get_document_qa_count(self, doc_id: str) -> int:
+        """
+        Get Q&A count for document
+        
+        Args:
+            doc_id: Document ID
+        
+        Returns:
+            Number of Q&As
+        """
         try:
             collection = self.weaviate_manager.client.collections.get("DocumentQA")
             
-            # Build filter
-            filters = None
-            if doc_id:
-                filters = Filter.by_property("doc_id").equal(doc_id)
-            
-            response = collection.query.near_text(
-                query=query,
-                limit=limit,
-                filters=filters
+            response = collection.query.fetch_objects(
+                filters=Filter.by_property("doc_id").equal(doc_id),
+                limit=100
             )
             
-            results = []
-            for item in response.objects:
-                results.append({
-                    'doc_id': item.properties.get('doc_id'),
-                    'question': item.properties.get('question'),
-                    'answer': item.properties.get('answer'),
-                    'relevance': item.metadata.distance
-                })
+            count = len(response.objects)
+            logger.info(f"[GET QA COUNT] Doc: {doc_id} | Count: {count}")
             
-            return results
+            return count
             
         except Exception as e:
-            logger.error(f"Document Q&A search failed: {e}")
-            return []
+            logger.error(f"[GET QA COUNT] Error: {e}")
+            return 0
+    
+    def _generate_hash(self, filename: str, user_id: str) -> str:
+        """
+        Generate unique document ID hash
+        
+        Args:
+            filename: Filename
+            user_id: User ID
+        
+        Returns:
+            12-character hash
+        """
+        timestamp = datetime.now().isoformat()
+        hash_input = f"{filename}_{user_id}_{timestamp}"
+        return hashlib.md5(hash_input.encode()).hexdigest()[:12]
+    
+    def _hash_filename(self, filename: str) -> str:
+        """
+        Hash filename for duplicate detection
+        
+        Args:
+            filename: Filename
+        
+        Returns:
+            MD5 hash
+        """
+        return hashlib.md5(filename.encode()).hexdigest()
     
     def close(self):
         """Close connections"""
         try:
+            logger.info("[SESSION MANAGER] Closing connections...")
             self.weaviate_manager.close()
-            logger.info("Document Session Manager closed")
+            logger.info("[SESSION MANAGER] Connections closed")
         except Exception as e:
-            logger.error(f"Error closing connections: {e}")
+            logger.error(f"[SESSION MANAGER] Error closing: {e}")
 
 
 # Export
-__all__ = ['DocumentSessionManager', 'DocumentMetadata']
+__all__ = ['DocumentSessionManager']

@@ -23,4 +23,12 @@ transformers
 weaviate
 weaviate-client
 python-dateutil
+spacy
+torch
+torchvision
+faiss-cpu
+pinecone 
+weaviate-client
+langchain_community
+google-generativeai
 -e .

@@ -6,70 +6,80 @@ from utils.config_loader import load_config
 import yfinance as yf
 from datetime import datetime, timedelta
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any , Optional
 import pandas as pd
 import os
 from dotenv import load_dotenv
 load_dotenv()
 
-class MultiModalRetriever:
-    """Enhanced retriever that searches across text, images, and tables"""
+class EnhancedMultiModalRetriever:
+    """
+    Enhanced retriever with document-specific filtering
+    Supports text, images, and tables with document isolation
+    """
     
     def __init__(self):
         self.model_loader = ModelLoader()
         self.embeddings = self.model_loader.load_embeddings()
         self.config = load_config()
         
-        pinecone_api_key = os.getenv("PINECONE_API_KEY")#self.config["vector_db"]["api_key"]
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
         index_name = self.config["vector_db"]["index_name"]
         
         pc = Pinecone(api_key=pinecone_api_key)
         self.index = pc.Index(index_name)
     
-    def search(self, query: str, search_type: str = "all", k: int = 5) -> str:
+    def search_document(
+        self,
+        query: str,
+        doc_id: Optional[str] = None,
+        search_type: str = "all",
+        k: int = 5
+    ) -> str:
         """
-        Search across multi-modal content
+        Search multimodal content with optional document filtering
         
         Args:
             query: Search query
+            doc_id: Optional document ID to restrict search
             search_type: 'text', 'images', 'tables', or 'all'
-            k: Number of results to return
+            k: Number of results per type
+            
+        Returns:
+            Formatted search results
         """
         results = []
         
+        # Build metadata filter for document
+        filter_dict = {"doc_id": doc_id} if doc_id else None
+        
+        # Search text namespace
         if search_type in ["all", "text"]:
-            text_store = PineconeVectorStore(
-                index=self.index,
-                embedding=self.embeddings,
-                namespace="text"
+            text_results = self._search_namespace(
+                "text", query, k, filter_dict
             )
-            text_results = text_store.similarity_search(query, k=k)
             results.extend([{
                 'type': 'text',
                 'content': doc.page_content,
                 'metadata': doc.metadata
             } for doc in text_results])
         
+        # Search images namespace
         if search_type in ["all", "images"]:
-            image_store = PineconeVectorStore(
-                index=self.index,
-                embedding=self.embeddings,
-                namespace="images"
+            image_results = self._search_namespace(
+                "images", query, k, filter_dict
             )
-            image_results = image_store.similarity_search(query, k=k)
             results.extend([{
                 'type': 'image',
                 'caption': doc.page_content,
                 'metadata': doc.metadata
             } for doc in image_results])
         
+        # Search tables namespace
         if search_type in ["all", "tables"]:
-            table_store = PineconeVectorStore(
-                index=self.index,
-                embedding=self.embeddings,
-                namespace="tables"
+            table_results = self._search_namespace(
+                "tables", query, k, filter_dict
             )
-            table_results = table_store.similarity_search(query, k=k)
             results.extend([{
                 'type': 'table',
                 'content': doc.page_content,
@@ -77,43 +87,163 @@ class MultiModalRetriever:
             } for doc in table_results])
         
         if not results:
+            if doc_id:
+                return f"No relevant information found in this document for: {query}"
             return "No relevant information found in the knowledge base."
         
-        # Format results
+        return self._format_results(results)
+    
+    def _search_namespace(
+        self,
+        namespace: str,
+        query: str,
+        k: int,
+        filter_dict: Optional[Dict] = None
+    ) -> List[Any]:
+        """Search specific namespace with optional filtering"""
+        try:
+            vector_store = PineconeVectorStore(
+                index=self.index,
+                embedding=self.embeddings,
+                namespace=namespace
+            )
+            
+            # Use similarity search with metadata filter
+            if filter_dict:
+                results = vector_store.similarity_search(
+                    query,
+                    k=k,
+                    filter=filter_dict
+                )
+            else:
+                results = vector_store.similarity_search(query, k=k)
+            
+            return results
+            
+        except Exception as e:
+            print(f"[ERROR] Namespace search failed ({namespace}): {e}")
+            return []
+    
+    def _format_results(self, results: List[Dict]) -> str:
+        """Format multimodal results for LLM consumption"""
         formatted = []
-        for r in results:
-            if r['type'] == 'text':
-                formatted.append(f"[TEXT] {r['content']}")
-            elif r['type'] == 'image':
-                formatted.append(f"[IMAGE] {r['caption']}")
-            elif r['type'] == 'table':
-                formatted.append(f"[TABLE] {r['content']}")
         
-        return "\n\n".join(formatted)
+        for r in results:
+            content_type = r['type']
+            metadata = r.get('metadata', {})
+            
+            if content_type == 'text':
+                page = metadata.get('page', 'unknown')
+                source = metadata.get('source', 'document')
+                formatted.append(
+                    f"[TEXT from {source}, page {page}]\n{r['content']}\n"
+                )
+            
+            elif content_type == 'image':
+                page = metadata.get('page_num', 'unknown')
+                caption = r.get('caption', 'Image')
+                formatted.append(
+                    f"[IMAGE on page {page}]\nCaption: {caption}\n"
+                )
+            
+            elif content_type == 'table':
+                page = metadata.get('page', 'unknown')
+                formatted.append(
+                    f"[TABLE from page {page}]\n{r['content']}\n"
+                )
+        
+        return "\n".join(formatted)
+    
+    def search_by_type(
+        self,
+        query: str,
+        content_type: str,
+        doc_id: Optional[str] = None,
+        k: int = 3
+    ) -> str:
+        """
+        Search for specific content type
+        
+        Args:
+            query: Search query
+            content_type: 'text', 'image', or 'table'
+            doc_id: Optional document filter
+            k: Number of results
+        """
+        return self.search_document(query, doc_id, content_type, k)
 
 
-# Initialize global retriever
-multimodal_retriever = MultiModalRetriever()
+# Global retriever instance
+enhanced_retriever = EnhancedMultiModalRetriever()
 
 
 @tool
-def multimodal_retriever_tool(query: str) -> str:
+def document_multimodal_retriever_tool(query: str, doc_id: str = None) -> str:
     """
-    Search the multi-modal knowledge base (text, images, tables) for trading information.
-    Use this for questions about:
-    - Trading strategies and concepts from documents
-    - Charts and visual analysis from uploaded PDFs
-    - Financial tables and data from documents
-    - Historical trading information
+    Search multimodal knowledge base (text, images, tables) for document-specific queries.
+    
+    USE THIS TOOL for document-based questions about:
+    - Content from uploaded PDFs or documents
+    - Charts, images, or visual elements in documents
+    - Tables or structured data in documents
+    - Historical information stored in documents
     
     Args:
         query: The search query
+        doc_id: Optional document ID to restrict search to specific document
+        
+    Returns:
+        Relevant content from text, images, and tables
     """
     try:
-        return multimodal_retriever.search(query, search_type="all", k=5)
+        return enhanced_retriever.search_document(
+            query=query,
+            doc_id=doc_id,
+            search_type="all",
+            k=5
+        )
     except Exception as e:
         return f"Error searching knowledge base: {str(e)}"
 
+
+@tool
+def find_document_images(query: str, doc_id: str = None) -> str:
+    """
+    Search specifically for images/charts in documents.
+    
+    Args:
+        query: What to look for in images
+        doc_id: Optional document ID
+    """
+    try:
+        return enhanced_retriever.search_by_type(
+            query=query,
+            content_type="images",
+            doc_id=doc_id,
+            k=3
+        )
+    except Exception as e:
+        return f"Error searching images: {str(e)}"
+
+
+@tool
+def find_document_tables(query: str, doc_id: str = None) -> str:
+    """
+    Search specifically for tables in documents.
+    
+    Args:
+        query: What to look for in tables
+        doc_id: Optional document ID
+    """
+    try:
+        return enhanced_retriever.search_by_type(
+            query=query,
+            content_type="tables",
+            doc_id=doc_id,
+            k=3
+        )
+    except Exception as e:
+        return f"Error searching tables: {str(e)}"
 
 class StockComparisonEngine:
     """Engine for comprehensive stock comparisons"""
@@ -347,7 +477,10 @@ def get_stock_price_tool(ticker: str) -> str:
 
 # Export all tools
 __all__ = [
-    'multimodal_retriever_tool',
     'compare_stocks_tool',
-    'get_stock_price_tool'
+    'get_stock_price_tool',
+    'document_multimodal_retriever_tool',
+    'find_document_images',
+    'find_document_tables',
+    'EnhancedMultiModalRetriever'
 ]
