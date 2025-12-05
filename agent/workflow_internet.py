@@ -19,18 +19,19 @@ import re
 from datetime import datetime
 
 from utils.model_loaders import ModelLoader
-from utils.memory_manager import RedisMemoryManager
+from utils.memory_manager import RedisMemoryManager , ConversationSummaryBuffer
 from utils.cache_manager import get_cache_manager
 from toolkit.tools import tavilytool, yahoo_finance_tool
 from custom_logging.my_logger import logger, log_execution_time
 from exception.exceptions import WorkflowException
-
+from utils.reference_resolver import ReferenceResolver
 
 class InternetState(TypedDict):
     """State for internet workflow"""
     messages: Annotated[list, add_messages]
     query_type: str  # 'greeting', 'stock', 'news', 'general'
     session_id: str
+    user_id:str
     is_fast_path: bool
     tickers: List[str]  # Extracted ticker symbols
     needs_tools: bool
@@ -256,10 +257,12 @@ class SystemPromptBuilder:
     BASE_PROMPT = """You are a **Financial Assistant** powered by advanced AI for fast, accurate responses.
     ***Note : do not use specicial characters like <,>,/,* in your response.
     make the response cleaner and adjust the message to fit into the message box***
-**CONVERSATION CONTEXT:**
+    USER MEMORY:
+{entity_memory}
+CONVERSATION CONTEXT:
 {conversation_history}
 
-**CURRENT DATE:** {current_date}
+CURRENT DATE: {current_date}
 """
     
     STOCK_PROMPT = BASE_PROMPT + """
@@ -271,6 +274,7 @@ class SystemPromptBuilder:
 3. Show change/percentage with visual indicators ( ↑ for up, ↓ for down)
 4. Include relevant metrics (volume, market cap if available)
 5. Keep response concise and scannable
+6.if you are displaying tables make sure they are in markdown format and properly aligned
 
 **FORMAT EXAMPLE:**
 Apple Inc (AAPL)
@@ -295,55 +299,57 @@ USER QUERY: {user_query}
 5. Use bullet points for clarity
 
 **FORMAT EXAMPLE:**
-📰 **Latest Tesla News:**
+📰 Latest Tesla News:
 
-• **Production Milestone** (Reuters, Dec 2024)
+• Production Milestone (Reuters, Dec 2024)
   Tesla reaches 2M vehicle production...
 
-• **Stock Performance** (Bloomberg, Dec 2024)
+• Stock Performance (Bloomberg, Dec 2024)
   Shares up 5% following...
 
-**TOOL RESULTS:**
+TOOL RESULTS:
 {tool_results}
 
-**USER QUERY:** {user_query}
+USER QUERY:{user_query}
 """
     
     GENERAL_PROMPT = BASE_PROMPT + """
 **QUERY TYPE:** General Financial Query
 
-**YOUR TASK:**
+YOUR TASK:
 1. Provide accurate, helpful financial information
 2. Use tool results to support your answer
 3. Be conversational but professional
 4. Cite sources when referencing specific data
 5. Keep responses focused and actionable
 
-**TOOL RESULTS:**
+TOOL RESULTS:
 {tool_results}
 
-**USER QUERY:** {user_query}
+USER QUERY:{user_query}
 """
     
     @classmethod
-    def build(cls, query_type: str, user_query: str, tool_results: str, history: str) -> str:
-        """Build prompt based on query type"""
-        current_date = datetime.now().strftime("%B %d, %Y")
-        
-        prompt_templates = {
-            'stock': cls.STOCK_PROMPT,
-            'news': cls.NEWS_PROMPT,
-            'general': cls.GENERAL_PROMPT,
-        }
-        
-        template = prompt_templates.get(query_type, cls.GENERAL_PROMPT)
-        
-        return template.format(
-            conversation_history=history or "No previous conversation",
-            current_date=current_date,
-            tool_results=tool_results,
-            user_query=user_query
-        )
+    def build(cls, query_type, user_query, tool_results, history, entity_memory_dict):
+            entity_block = "\n".join(f"- {k}: {v}" for k, v in entity_memory_dict.items()) or "No stored user info."
+
+            current_date = datetime.now().strftime("%B %d, %Y")
+
+            templates = {
+                "stock": cls.STOCK_PROMPT,
+                "news": cls.NEWS_PROMPT,
+                "general": cls.GENERAL_PROMPT,
+            }
+
+            template = templates.get(query_type, cls.GENERAL_PROMPT)
+
+            return template.format(
+                entity_memory=entity_block,
+                conversation_history=history,
+                current_date=current_date,
+                tool_results=tool_results,
+                user_query=user_query
+            )
 
 
 class OptimizedInternetWorkflow:
@@ -363,12 +369,13 @@ class OptimizedInternetWorkflow:
             
             # LLM (Groq for speed)
             self.model_loader = ModelLoader()
+            
             self.llm = self.model_loader.load_llm()
             logger.info("[WORKFLOW] Groq LLM loaded")
             
             # Redis STM only
             self._setup_redis()
-            
+            self.reference_resolver = ReferenceResolver(self.redis_memory)
             # Tools
             self.tools = [tavilytool, yahoo_finance_tool]
             logger.info("[WORKFLOW] Tools loaded: Tavily, Yahoo Finance")
@@ -390,6 +397,7 @@ class OptimizedInternetWorkflow:
             self.redis_memory = RedisMemoryManager(
                 host=os.getenv('REDIS_HOST', 'localhost'),
                 port=int(os.getenv('REDIS_PORT', 6380)),
+                db=0,
                 ttl_hours=2  # Auto-expire after 2 hours
             )
             logger.info("[REDIS] Connected for STM")
@@ -439,38 +447,49 @@ class OptimizedInternetWorkflow:
     def _intent_classification_node(self, state: InternetState) -> InternetState:
         """
         Node 2: Smart intent classification (Stock/News/General)
-        Target: <100ms classification time
+        Includes entity extraction + reference resolution.
         """
         try:
-            # Skip if fast-path
+            # 1️⃣ Skip processing if fast-path routed already
+            print(state," this is state")
             if state.get("is_fast_path", False):
                 return state
-            
+
             messages = state["messages"]
             last_message = messages[-1] if messages else None
-            
-            if not last_message:
+
+            # 2️⃣ If no message, nothing to classify
+            if not last_message or not hasattr(last_message, "content"):
                 return state
-            
-            query = last_message.content
-            logger.info(f"[INTENT] Classifying: {query[:60]}...")
-            
-            # Fast intent classification
-            intent_data = SmartIntentClassifier.classify(query)
-            
+
+            raw_query = last_message.content
+            user_id = state["user_id"]
+
+            # 3️⃣ Extract entities from the raw query
+            self.redis_memory.extract_entities(user_id, raw_query)
+
+            # 4️⃣ Resolve references for pronouns ("it", "that company", etc.)
+            resolved_query = self.reference_resolver.resolve(user_id, raw_query)
+            last_message.content = resolved_query  # mutation allowed (LangChain message is mutable)
+
+            logger.info(f"[INTENT] After resolution: {resolved_query[:80]}")
+
+            # 5️⃣ Classify USING THE RESOLVED QUERY (important)
+            intent_data = SmartIntentClassifier.classify(resolved_query)
+
             logger.info(
                 f"[INTENT] Type: {intent_data['query_type']} | "
                 f"Tickers: {intent_data['tickers']} | "
                 f"Needs tools: {intent_data['needs_tools']}"
             )
-            
+
             return {
                 **state,
-                "query_type": intent_data['query_type'],
-                "tickers": intent_data['tickers'],
-                "needs_tools": intent_data['needs_tools']
+                "query_type": intent_data["query_type"],
+                "tickers": intent_data["tickers"],
+                "needs_tools": intent_data["needs_tools"]
             }
-            
+
         except Exception as e:
             logger.error(f"[INTENT] Classification error: {e}")
             return {
@@ -478,39 +497,44 @@ class OptimizedInternetWorkflow:
                 "query_type": "general",
                 "needs_tools": True
             }
+
     
     @log_execution_time
     def _response_node(self, state: InternetState) -> Dict:
         """
         Node 3: Generate response (Fast-path OR LLM+Tools)
+        Cleaned, safe, cached, entity-aware.
         """
         try:
             messages = state["messages"]
             session_id = state.get("session_id", "default")
+            user_id = state.get("user_id", "static_test_user")
             query_type = state.get("query_type", "general")
             is_fast_path = state.get("is_fast_path", False)
-            
+
             last_message = messages[-1] if messages else None
-            
-            if not last_message:
+
+            # 1️⃣ No message → nothing to answer
+            if not last_message or not hasattr(last_message, "content"):
                 return {"messages": [AIMessage(content="No query provided.")]}
-            
+
             query = last_message.content
-            
-            # FAST PATH: Instant response
+
+            # 2️⃣ FAST-PATH HANDLING (skip all heavy operations)
             if is_fast_path:
                 logger.info(f"[RESPONSE] ⚡ Fast-path: {query_type}")
+
                 response_text = FastPathRouter.get_response(query_type)
-                
-                # Store in STM
+
+                # Store fast-path reply
                 self.redis_memory.store_message(session_id, {
-                    'role': 'assistant',
-                    'content': response_text
+                    "role": "assistant",
+                    "content": response_text
                 })
-                
+
                 return {"messages": [AIMessage(content=response_text)]}
-            
-            # NORMAL PATH: Check cache first
+
+            # 3️⃣ CACHE CHECK
             cache_key = self.cache_manager._generate_key(
                 query, query_type, prefix="internet_response"
             )
@@ -519,51 +543,61 @@ class OptimizedInternetWorkflow:
             if cached_response:
                 logger.info("[RESPONSE] 💾 Cache hit")
                 return {"messages": [cached_response]}
-            
-            # Get conversation history (last 4 messages for context)
+
+            # 4️⃣ GET STM CONTEXT (last 4)
             redis_history = self.redis_memory.get_langchain_messages(session_id, limit=4)
-            
-            # Format conversation history
-            conversation_history = "\n".join([
-                f"{'User' if isinstance(msg, HumanMessage) else 'Assistant'}: {msg.content[:150]}..."
-                for msg in redis_history[-4:]
-            ]) if redis_history else "No previous conversation"
-            
-            # Build query-specific system prompt
-            system_msg = SystemPromptBuilder.build(
+
+            if redis_history:
+                conversation_history = "\n".join([
+                    f"{'User' if isinstance(msg, HumanMessage) else 'Assistant'}: {msg.content[:150]}..."
+                    for msg in redis_history[-4:]
+                ])
+            else:
+                conversation_history = "No previous conversation"
+
+            # 5️⃣ LOAD ENTITY MEMORY FOR USER
+            entity_memory = self.redis_memory.get_all_entities(user_id)
+
+            # 6️⃣ BUILD SYSTEM PROMPT WITH ENTITY CONTEXT
+            system_prompt = SystemPromptBuilder.build(
                 query_type=query_type,
                 user_query=query,
                 tool_results="[Tool results will be inserted after execution]",
-                history=conversation_history
+                history=conversation_history,
+                entity_memory_dict=entity_memory
             )
-            
-            # Prepare messages for LLM
-            messages_with_system = [SystemMessage(content=system_msg)] + redis_history[-3:]
-            
-            # Invoke LLM with tools
-            logger.info(f"[RESPONSE] 🤖 Generating response for: {query_type}")
+
+            # 7️⃣ MESSAGE STACK TO LLM
+            messages_with_system = [SystemMessage(content=system_prompt)]
+            if len(redis_history) >= 1:
+                messages_with_system += redis_history[-3:]
+
+            # 8️⃣ CALL LLM WITH TOOLS
+            logger.info(f"[RESPONSE] 🤖 Generating response for query_type={query_type}")
             response = self.llm.bind_tools(tools=self.tools).invoke(messages_with_system)
-            
-            # Cache response
+
+            # 9️⃣ STORE RESPONSE IN CACHE
             self.cache_manager.set(cache_key, response)
-            
-            # Store in STM
-            if hasattr(response, 'content'):
+
+            # 🔟 STORE ASSISTANT MESSAGE IN STM
+            if hasattr(response, "content"):
                 self.redis_memory.store_message(session_id, {
-                    'role': 'assistant',
-                    'content': response.content
+                    "role": "assistant",
+                    "content": response.content
                 })
-            
-            logger.info(f"[RESPONSE] ✓ Generated for {query_type}")
-            
+
+            logger.info(f"[RESPONSE] ✓ Completed for {query_type}")
+
             return {"messages": [response]}
-            
+
         except Exception as e:
             logger.error(f"[RESPONSE] Error: {e}")
-            error_msg = AIMessage(
-                content="I'm experiencing technical difficulties. Please try again in a moment."
-            )
-            return {"messages": [error_msg]}
+            return {
+                "messages": [
+                    AIMessage(content="I'm experiencing technical difficulties. Please try again.")
+                ]
+            }
+
     
     def _route_to_tools_or_end(self, state: InternetState) -> str:
         """Conditional edge: Route to tools or end"""

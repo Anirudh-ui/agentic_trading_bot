@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import sys
 
-from utils.memory_manager import RedisMemoryManager, WeaviateMemoryManager
+from utils.memory_manager import RedisMemoryManager_document, WeaviateMemoryManager
 from weaviate.classes.config import Property, DataType
 from weaviate.classes.query import Filter
 from custom_logging.my_logger import logger, log_execution_time
@@ -54,7 +54,7 @@ class DocumentSessionManager:
             logger.info("[SESSION MANAGER] Initializing...")
             
             # Redis for short-term memory
-            self.redis_manager = RedisMemoryManager(
+            self.redis_manager = RedisMemoryManager_document(
                 host=redis_host,
                 port=redis_port,
                 ttl_hours=48

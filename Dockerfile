@@ -1,29 +1,30 @@
-# Use an official Python runtime as a parent image
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-# Set the working directory in the container
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    gcc \
+    poppler-utils \
+    libpoppler-cpp-dev \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install uv
+
 WORKDIR /app
 
-# ----------------------------------------------------
-# 1. INSTALL POPPLER (CRITICAL FIX FOR PDF PROCESSING)
-# poppler-utils is the necessary package for PDF analysis
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    poppler-utils \
-    # Clean up the package lists to keep the image small
-    && rm -rf /var/lib/apt/lists/*
-# ----------------------------------------------------
+# 1. Copy ONLY requirements first to leverage Docker cache
+COPY requirements.txt .
 
-# Copy the current directory contents into the container at /app
-COPY . /app
+# 2. Install deps once (layer is cached until requirements.txt changes)
+RUN uv pip install --system -r requirements.txt
 
-# Install any dependencies specified in requirements.txt
-# Using pip directly here for simplicity, but you can swap to uv if preferred.
-RUN pip install --no-cache-dir --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# 3. Now copy the rest of your project
+COPY . .
 
-# Make port 8000 available to the world outside this container
 EXPOSE 8000
 
-# Run the application using uvicorn (assuming you use FastAPI)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,61 +1,33 @@
-version: '3.8'
+version: "3.9"
 
 services:
-  # 1. The main application service (App)
-  app:
-    build: .
-    container_name: genai-rag-app
-    ports:
-      - "8000:8000"
-    depends_on:
-      redis:
-        condition: service_healthy
-      weaviate:
-        condition: service_healthy
-    environment:
-      WEAVIATE_HOST: weaviate
-      REDIS_HOST: redis
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY} 
-    # VOLUME MOUNT for instant code changes
-    volumes:
-      - .:/app 
-    # '--reload' for uvicorn to auto-restart on code changes
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"] 
-
-  # 2. Redis - Short-term memory storage
   redis:
     image: redis:7-alpine
-    container_name: trading-bot-redis
+    container_name: lc_redis
+    restart: unless-stopped
     ports:
-      - "6380:6379" 
-    volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+      interval: 30s
+      timeout: 5s
+      retries: 5
 
-  # 3. Weaviate - Long-term memory storage
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.34.0
-    container_name: trading-bot-weaviate
+    image: semitechnologies/weaviate:1.28.7 #1.25.3
+    container_name: lc_weaviate
+    restart: unless-stopped
     ports:
       - "8080:8080"
       - "50051:50051"
     environment:
       QUERY_DEFAULTS_LIMIT: 25
-      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
-      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-      DEFAULT_VECTORIZER_MODULE: 'none'
-      ENABLE_MODULES: ''
-      CLUSTER_HOSTNAME: 'node1'
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      CLUSTER_HOSTNAME: "node1"
     volumes:
       - weaviate_data:/var/lib/weaviate
 
 volumes:
-  redis_data:
-    driver: local
   weaviate_data:
-    driver: local

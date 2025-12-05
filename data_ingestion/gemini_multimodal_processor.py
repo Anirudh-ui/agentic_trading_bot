@@ -63,7 +63,7 @@ class GeminiMultimodalProcessor:
             genai.configure(api_key=api_key)
             
             # Initialize Gemini Flash model
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            self.model = genai.GenerativeModel('gemini-1.5-flash-latest')
             logger.info("[GEMINI] Model initialized: gemini-1.5-flash")
             
             # Safety settings (allow all for document processing)

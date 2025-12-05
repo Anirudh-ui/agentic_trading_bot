@@ -1,34 +1,63 @@
-langchain>=0.2.20
-langgraph==1.0.3
-tavily-python
-polygon
-langchain_community
-langchain_google_genai
-streamlit
-fastapi[all]
-uvicorn
-langchain-pinecone
+# ========================
+# LANGCHAIN 0.3 ECOSYSTEM
+# ========================
+langchain==0.3.27
+langchain-core==0.3.76
+langchain-community==0.3.29
+langchain-google-genai==2.1.10
+langchain-groq==0.3.7
+
+
+# ========================
+# VECTORS / MEMORY
+# ========================
+pinecone
+weaviate-client
+redis
+faiss-cpu
+
+# ========================
+# LLM / EMBEDDINGS / NLP
+# ========================
+
+transformers
+
+pydantic==2.12.5
+python-dateutil
+
+# ========================
+# SEARCH / FINANCE
+# ========================
+tavily-python==0.7.13
+yfinance>=0.2.40
+polygon==1.2.8
+requests==2.32.5
+tenacity>=8.2.0
+
+# ========================
+# UTILITIES
+# ========================
 pypdf
 pyyaml
-requests
-yfinance>=0.2.40
-tenacity>=8.2.0
-scikit-learn>=1.3.0
-langchain_groq
-langchain-tavily
-redis
-dotenv
-langgraph[redis]
-transformers
-weaviate
-weaviate-client
-python-dateutil
+python-dotenv
+pdf2image
+pdftotext
 spacy
-torch
-torchvision
-faiss-cpu
-pinecone 
-weaviate-client
-langchain_community
-google-generativeai
--e .
+
+# ========================
+# SERVER / API
+# ========================
+fastapi==0.110.0
+uvicorn==0.30.3
+
+# ========================
+# ML / DATA
+# ========================
+scikit-learn>=1.3.0
+numpy
+pandas
+
+# ========================
+# STREAMLIT (if used)
+# =
+streamlit==1.30.0

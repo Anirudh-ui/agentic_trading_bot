@@ -1,17 +1,15 @@
-# Ignore local Python environment
-.venv
+node_modules
 venv
+.env
+.env.*
 __pycache__
-
-# Ignore development data and temporary files
 *.pyc
+.git
+.gitignore
+.next
+dist
+build
+frontend/node_modules
+frontend/.next
 *.log
-.DS_Store
-.vscode/
-
-# Ignore large data directories
-/data_files
-/notebooks
-
-# Ignore the Streamlit cache directory
-.streamlit
+archive

@@ -16,7 +16,7 @@ from datetime import datetime
 import sys
 import os
 import tempfile
-
+import json
 # Internal imports
 from agent.workflow_internet import InternetWorkflowBuilder
 from agent.workflow_document import DocumentRAGWorkflowBuilder
@@ -24,7 +24,7 @@ from data_ingestion.gemini_multimodal_processor import GeminiMultimodalProcessor
 from utils.document_session_manager import DocumentSessionManager
 from exception.exceptions import TradingBotException, ValidationException
 from custom_logging.my_logger import logger, log_execution_time
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage , AIMessage
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -49,7 +49,6 @@ app.add_middleware(
 logger.info("=" * 60)
 logger.info("STARTING TRADING BOT API - TWO-LLM ARCHITECTURE")
 logger.info("=" * 60)
-
 # Internet workflow (STM only)
 try:
     internet_workflow = InternetWorkflowBuilder()
@@ -313,7 +312,6 @@ async def upload_document(file: UploadFile = File(...)):
 
 
 @app.post("/document-query", response_model=QueryResponse)
-@log_execution_time
 async def document_query(request: DocumentQueryRequest):
     """
     Query document using two-LLM workflow:
@@ -426,7 +424,7 @@ async def internet_query(request: InternetQueryRequest):
         
         logger.info(f"[INTERNET] Session: {request.session_id}")
         logger.info(f"[INTERNET] Query: {request.question[:80]}...")
-        
+        USER_ID = "static_test_user"
         # Store user message in STM
         internet_workflow.redis_memory.store_message(request.session_id, {
             'role': 'user',
@@ -438,6 +436,7 @@ async def internet_query(request: InternetQueryRequest):
             "messages": [HumanMessage(content=request.question)],
             "query_type": "unknown",
             "session_id": request.session_id,
+            "user_id": USER_ID,
             "is_fast_path": False,
             "tickers": [],
             "needs_tools": True
@@ -624,7 +623,6 @@ async def get_user_documents(user_id: str = "static_test_user"):
 
 
 @app.get("/get-document-summary/{doc_id}")
-@log_execution_time
 async def get_document_summary(doc_id: str):
     """Get conversation summary for document"""
     try:

@@ -1,0 +1,15 @@
+# pyproject.toml
+
+[build-system]
+# This defines the minimum requirements for tools that will read this file.
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading_bot_project" # Choose a unique name
+version = "0.1.0"
+description = "Financial and Trading Bot GenAI Project"
+# Minimal necessary metadata
+readme = "README.md"
+
+requires-python = ">=3.12"

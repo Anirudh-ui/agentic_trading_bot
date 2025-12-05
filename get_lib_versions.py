@@ -19,7 +19,8 @@ packages = [
     "langchain_groq",
     "langchain-tavily",
     "redis",
-    "dotenv"
+    "dotenv",
+    'pydantic'
     ]
 for pkg in packages:
     try:

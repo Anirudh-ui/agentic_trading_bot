@@ -59,85 +59,6 @@ def retriever_tool(question: str):
     except Exception as e:
         return f"Error retrieving from knowledge base: {str(e)}"
 
-
-@tool
-def yahoo_finance_tool(query: str):
-    """
-    Real-time stock market data tool using Yahoo Finance.
-    USE THIS for: stock prices, company financials, market data, earnings, dividends.
-    
-    Supports:
-    - Stock prices: "AAPL", "TSLA", "MSFT"
-    - Company info: market cap, PE ratio, dividends
-    - Historical data: 52-week high/low
-    - Financial metrics: earnings, revenue, profit
-    
-    Args:
-        query: Stock ticker symbol or company name with specific question
-        
-    Returns:
-        Comprehensive stock data and metrics
-    """
-    try:
-        # Extract ticker symbol from query
-        ticker = extract_ticker(query)
-        
-        if not ticker:
-            return "Please provide a valid stock ticker symbol (e.g., AAPL, TSLA, MSFT)"
-        
-        # Get stock data
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        
-        # Get current price data
-        current_data = stock.history(period="1d")
-        
-        if current_data.empty:
-            return f"No data found for ticker: {ticker}. Please verify the symbol."
-        
-        # Build comprehensive response
-        response = f"**{info.get('longName', ticker)} ({ticker})**\n\n"
-        
-        # Price information
-        current_price = current_data['Close'].iloc[-1]
-        open_price = current_data['Open'].iloc[-1]
-        high = current_data['High'].iloc[-1]
-        low = current_data['Low'].iloc[-1]
-        volume = current_data['Volume'].iloc[-1]
-        
-        response += f"**Current Price:** ${current_price:.2f}\n"
-        response += f"**Open:** ${open_price:.2f}\n"
-        response += f"**Day High:** ${high:.2f}\n"
-        response += f"**Day Low:** ${low:.2f}\n"
-        response += f"**Volume:** {volume:,.0f}\n\n"
-        
-        # Company metrics
-        if 'marketCap' in info:
-            response += f"**Market Cap:** ${info['marketCap']:,.0f}\n"
-        
-        if 'trailingPE' in info:
-            response += f"**P/E Ratio:** {info['trailingPE']:.2f}\n"
-        
-        if 'dividendYield' in info and info['dividendYield']:
-            response += f"**Dividend Yield:** {info['dividendYield']*100:.2f}%\n"
-        
-        if 'fiftyTwoWeekHigh' in info:
-            response += f"**52 Week High:** ${info['fiftyTwoWeekHigh']:.2f}\n"
-        
-        if 'fiftyTwoWeekLow' in info:
-            response += f"**52 Week Low:** ${info['fiftyTwoWeekLow']:.2f}\n"
-        
-        # Business summary (truncated)
-        if 'longBusinessSummary' in info:
-            summary = info['longBusinessSummary'][:300] + "..." if len(info['longBusinessSummary']) > 300 else info['longBusinessSummary']
-            response += f"\n**Company Overview:**\n{summary}\n"
-        
-        return response
-        
-    except Exception as e:
-        return f"Error fetching stock data: {str(e)}. Please verify the ticker symbol."
-
-
 def extract_ticker(query: str) -> Optional[str]:
     """
     Extract stock ticker from query
@@ -175,7 +96,17 @@ def extract_ticker(query: str) -> Optional[str]:
         'pepsi': 'PEP',
         'mcdonalds': 'MCD',
         'nike': 'NKE',
-        'starbucks': 'SBUX'
+        'starbucks': 'SBUX',
+        'reliance': 'RELIANCE.NS',
+        'tcs': 'TCS.NS',
+        'infosys': 'INFY.NS',
+        'hdfc': 'HDFCBANK.NS',
+        'icici': 'ICICIBANK.NS',
+        'wipro': 'WIPRO.NS',
+        'bharti': 'BHARTIARTL.NS',
+        'airtel': 'BHARTIARTL.NS',
+        'itc': 'ITC.NS',
+        'sbi': 'SBIN.NS'
     }
     
     query_lower = query.lower()
@@ -184,6 +115,85 @@ def extract_ticker(query: str) -> Optional[str]:
             return ticker
     
     return None
+@tool
+def yahoo_finance_tool(query: str):
+    """
+    Real-time stock market data tool using Yahoo Finance.
+    USE THIS for: stock prices, company financials, market data, earnings, dividends.
+    
+    Supports:
+    - Stock prices: "AAPL", "TSLA", "MSFT"
+    - Company info: market cap, PE ratio, dividends
+    - Historical data: 52-week high/low
+    - Financial metrics: earnings, revenue, profit
+    
+    Args:
+        query: Stock ticker symbol or company name with specific question
+        
+    Returns:
+        Comprehensive stock data and metrics
+    """
+    try:
+        # Extract ticker symbol from query
+        ticker = extract_ticker(query)
+        print(f"Extracted ticker from tools : {ticker}")
+        if not ticker:
+            return "Please provide a valid stock ticker symbol (e.g., AAPL, TSLA, MSFT)"
+        
+        # Get stock data
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        # Get current price data
+        current_data = stock.history(period="1d")
+        
+        if current_data.empty:
+            return f"No data found for ticker: {ticker}. Please verify the symbol."
+        
+        # Build comprehensive response
+        response = f"**{info.get('longName', ticker)} ({ticker})**\n\n"
+        
+        # Price information
+        current_price = current_data['Close'].iloc[-1]
+        open_price = current_data['Open'].iloc[-1]
+        high = current_data['High'].iloc[-1]
+        low = current_data['Low'].iloc[-1]
+        volume = current_data['Volume'].iloc[-1]
+        
+        response += f"Current Price: ${current_price:.2f}\n"
+        response += f"Open: ${open_price:.2f}\n"
+        response += f"Day High: ${high:.2f}\n"
+        response += f"Day Low: ${low:.2f}\n"
+        response += f"Volume: {volume:,.0f}\n\n"
+        
+        # Company metrics
+        if 'marketCap' in info:
+            response += f"Market Cap: ${info['marketCap']:,.0f}\n"
+        
+        if 'trailingPE' in info:
+            response += f"P/E Ratio: {info['trailingPE']:.2f}\n"
+        
+        if 'dividendYield' in info and info['dividendYield']:
+            response += f"Dividend Yield: {info['dividendYield']*100:.2f}%\n"
+        
+        if 'fiftyTwoWeekHigh' in info:
+            response += f"52 Week High: ${info['fiftyTwoWeekHigh']:.2f}\n"
+        
+        if 'fiftyTwoWeekLow' in info:
+            response += f"52 Week Low: ${info['fiftyTwoWeekLow']:.2f}\n"
+        
+        # Business summary (truncated)
+        if 'longBusinessSummary' in info:
+            summary = info['longBusinessSummary'][:300] + "..." if len(info['longBusinessSummary']) > 300 else info['longBusinessSummary']
+            response += f"\n**Company Overview:**\n{summary}\n"
+        
+        return response
+        
+    except Exception as e:
+        return f"Error fetching stock data: {str(e)}. Please verify the ticker symbol."
+
+
+
 
 
 # Enhanced Tavily tool with better configuration
