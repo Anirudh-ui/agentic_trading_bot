@@ -25,7 +25,8 @@ from utils.document_session_manager import DocumentSessionManager
 from exception.exceptions import TradingBotException, ValidationException
 from custom_logging.my_logger import logger, log_execution_time
 from langchain_core.messages import HumanMessage , AIMessage
-
+from utils.postgres_manager import PostgresManager
+from data_models.models import * 
 # Initialize FastAPI app
 app = FastAPI(
     title="Trading Bot - Multimodal RAG API",
@@ -76,7 +77,13 @@ try:
 except Exception as e:
     logger.error(f"[STARTUP] Gemini processor failed: {e}")
     raise
-
+#postgres manager
+try:
+    postgres_manager = PostgresManager()
+    logger.info("[STARTUP] postgres processor initialized")
+except Exception as e:
+    logger.error(f"[STARTUP] postgres processor failed: {e}")
+    raise
 # Document session manager
 try:
     doc_session_manager = DocumentSessionManager(
@@ -91,54 +98,6 @@ except Exception as e:
     raise
 
 logger.info("[STARTUP] All components initialized successfully")
-
-# ==================== REQUEST/RESPONSE MODELS ====================
-
-class DocumentUploadResponse(BaseModel):
-    """Response model for document upload"""
-    doc_id: str = Field(..., description="Unique document ID")
-    name: str = Field(..., description="Document filename")
-    uploadedAt: str = Field(..., description="Upload timestamp")
-    size: str = Field(..., description="Document size")
-    page_count: int = Field(..., description="Number of pages")
-    is_first_time: bool = Field(..., description="First time uploading this document")
-    previous_summary: Optional[str] = Field(None, description="Summary of previous conversations")
-    has_tables: bool = Field(False, description="Document contains tables")
-    has_charts: bool = Field(False, description="Document contains charts")
-
-
-class DocumentQueryRequest(BaseModel):
-    """Request model for document query"""
-    question: str = Field(..., min_length=1, description="User question about document")
-    session_id: str = Field(..., description="Session ID (format: trade_doc_{doc_id})")
-    doc_id: str = Field(..., description="Document ID")
-    user_id: Optional[str] = Field("static_test_user", description="User ID")
-
-
-class InternetQueryRequest(BaseModel):
-    """Request model for internet query"""
-    question: str = Field(..., min_length=1, description="User query for internet search")
-    session_id: str = Field(..., description="Session ID (format: trade_app_{uuid})")
-
-
-class QueryResponse(BaseModel):
-    """Response model for queries"""
-    answer: str = Field(..., description="Generated answer")
-    session_id: str = Field(..., description="Session ID")
-    message_id: str = Field(..., description="Message ID")
-    timestamp: str = Field(..., description="Response timestamp")
-    sources: Optional[List[dict]] = Field(None, description="Source citations")
-    doc_summary: Optional[str] = Field(None, description="Document conversation summary")
-    query_type: Optional[str] = Field(None, description="Query type classification")
-    is_fast_path: Optional[bool] = Field(False, description="Fast-path response flag")
-
-
-class HealthResponse(BaseModel):
-    """Health check response"""
-    status: str
-    components: dict
-    timestamp: str
-    cache_stats: dict
 
 
 # ==================== UTILITY FUNCTIONS ====================
@@ -198,23 +157,17 @@ async def root():
 
 
 @app.post("/upload-document", response_model=DocumentUploadResponse)
-#@log_execution_time
 async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload and process document with Gemini multimodal processor
-    - Prevents duplicate uploads
-    - Extracts text, tables, and charts
-    - Stores in Pinecone vector database
-    """
     try:
-        user_id = "static_test_user"  # TODO: Replace with actual user authentication
-        
-        logger.info(f"[UPLOAD] Processing document: {file.filename}")
-        
-        # Validate file type
+        user_id = "static_test_user"  # TODO: replace later
+        logger.info(f"[UPLOAD] Incoming file: {file.filename}")
+
+        # ---------------------------------------------------
+        # 1) Validate file extension
+        # ---------------------------------------------------
         allowed_extensions = ['.pdf', '.docx', '.txt']
         file_ext = os.path.splitext(file.filename)[1].lower()
-        
+
         if file_ext not in allowed_extensions:
             raise ValidationException(
                 f"Unsupported file type: {file_ext}",
@@ -222,89 +175,104 @@ async def upload_document(file: UploadFile = File(...)):
                 filename=file.filename,
                 allowed=allowed_extensions
             )
-        
-        # Check for duplicate document
-        existing_doc = doc_session_manager.find_document_by_filename(
-            filename=file.filename,
-            user_id=user_id
-        )
-        
-        is_first_time = existing_doc is None
-        
-        if not is_first_time:
-            logger.info(f"[UPLOAD] Document already exists: {existing_doc['doc_id']}")
-            
-            # Return existing document info
+
+        # ---------------------------------------------------
+        # 2) Read bytes & compute hash
+        # ---------------------------------------------------
+        file_bytes = await file.read()
+        file_hash = postgres_manager.compute_hash(file_bytes)
+        file_size_bytes = len(file_bytes)
+
+        # ---------------------------------------------------
+        # 3) Duplicate check
+        # ---------------------------------------------------
+        existing = postgres_manager.find_by_hash(file_hash)
+
+        if existing:
+            logger.info(f"[UPLOAD] Duplicate found → {existing['doc_id']}")
+
             return DocumentUploadResponse(
-                doc_id=existing_doc['doc_id'],
-                name=file.filename,
-                uploadedAt=existing_doc['upload_timestamp'],
-                size=f"{existing_doc.get('page_count', 0)} pages",
-                page_count=existing_doc.get('page_count', 0),
+                doc_id=str(existing["doc_id"]),
+                name=existing["filename"],
+                uploadedAt=existing["uploaded_at"].isoformat(),
+                size=f"{existing['size_bytes']/1024:.1f} KB",
+                page_count=existing["page_count"],
                 is_first_time=False,
-                previous_summary=doc_session_manager.get_document_summary(existing_doc['doc_id']),
-                has_tables=False,
-                has_charts=False
+                previous_summary=existing.get("summary"),
+                has_tables=existing["has_tables"],
+                has_charts=existing["has_charts"],
             )
-        
-        # 1. Read file content from the UploadFile (must be done before creating temp file)
-        file_content = await file.read()
-        
-        # 2. Use tempfile to create a secure, accessible temporary path
-        # suffix ensures the correct file extension for PDF/DOCX readers
+
+        # ---------------------------------------------------
+        # 4) Save temporary file for Gemini
+        # ---------------------------------------------------
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-            tmp.write(file_content)
-            temp_path = tmp.name  # Get the guaranteed path
-        
-        logger.info(f"[UPLOAD] Saved temporary file to: {temp_path}")
-        
-        logger.info("[GEMINI] Starting multimodal processing...")
-        
-        # Process with Gemini
-        processed_data = gemini_processor.process_document(temp_path)
-        
-        logger.info(f"[GEMINI] Processing complete | Pages: {processed_data['page_count']}")
-        
-        # Register document
-        doc_id = doc_session_manager.register_document(
-            filename=file.filename,
-            file_type=file_ext.lstrip('.'),
+            tmp.write(file_bytes)
+            temp_path = tmp.name
+
+        logger.info(f"[UPLOAD] Temp file saved: {temp_path}")
+
+        # ---------------------------------------------------
+        # 5) Process PDF/DOCX via Gemini
+        # ---------------------------------------------------
+        processed = gemini_processor.process_document(temp_path)
+
+        page_count   = processed.get("page_count", 0)
+        has_tables   = len(processed.get("tables", [])) > 0
+        has_charts   = len(processed.get("charts", [])) > 0
+
+        # ---------------------------------------------------
+        # 6) Register document in Postgres
+        # ---------------------------------------------------
+        new_doc = postgres_manager.register_document(
             user_id=user_id,
-            page_count=processed_data['page_count'],
-            has_tables=len(processed_data.get('tables', [])) > 0,
-            has_charts=len(processed_data.get('charts', [])) > 0
+            filename=file.filename,
+            file_hash=file_hash,
+            file_type=file_ext.lstrip("."),
+            page_count=page_count,
+            has_tables=has_tables,
+            has_charts=has_charts,
+            size_bytes=file_size_bytes,
         )
-        
-        logger.info(f"[DOCUMENT] Registered: {doc_id}")
-        
-        # Store in Pinecone
+
+        doc_id = new_doc["doc_id"]
+        uploaded_at = new_doc["uploaded_at"]
+
+        logger.info(f"[POSTGRES] Inserted document {doc_id}")
+
+        # ---------------------------------------------------
+        # 7) Store chunks in Pinecone
+        # ---------------------------------------------------
         gemini_processor.store_in_pinecone(
-            processed_data=processed_data,
+            processed_data=processed,
             doc_id=doc_id,
-            filename=file.filename
+            filename=file.filename,
         )
-        
-        logger.info(f"[PINECONE] Stored vectors for doc: {doc_id}")
-        
+
+        logger.info(f"[PINECONE] Stored vectors for {doc_id}")
+
         # Cleanup
         os.remove(temp_path)
-        
+
+        # ---------------------------------------------------
+        # 8) Final response
+        # ---------------------------------------------------
         return DocumentUploadResponse(
-            doc_id=doc_id,
+            doc_id=str(doc_id),
             name=file.filename,
-            uploadedAt=datetime.now().isoformat(),
-            size=f"{len(file_content) / 1024:.1f} KB",
-            page_count=processed_data['page_count'],
+            uploadedAt=uploaded_at.isoformat(),
+            size=f"{file_size_bytes/1024:.1f} KB",
+            page_count=page_count,
             is_first_time=True,
             previous_summary=None,
-            has_tables=len(processed_data.get('tables', [])) > 0,
-            has_charts=len(processed_data.get('charts', [])) > 0
+            has_tables=has_tables,
+            has_charts=has_charts,
         )
-        
+
     except ValidationException:
         raise
     except TradingBotException as e:
-        logger.error(f"[UPLOAD] Application error: {e}")
+        logger.error(f"[UPLOAD] Known error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.error(f"[UPLOAD] Unexpected error: {e}")
@@ -320,15 +288,12 @@ async def document_query(request: DocumentQueryRequest):
     3. Groq generates conversational response with citations
     """
     try:
-        # Validate inputs
-        validate_session_id(request.session_id, "trade_doc_")
-        validate_doc_id(request.doc_id)
         
-        logger.info(f"[DOC QUERY] Doc: {request.doc_id} | Session: {request.session_id}")
+        logger.info(f"[DOC QUERY] Doc: {request.doc_id}")
         logger.info(f"[DOC QUERY] Question: {request.question[:100]}...")
         
         # Verify document exists
-        doc_metadata = doc_session_manager.get_document_metadata(request.doc_id)
+        doc_metadata = postgres_manager.get_document_metadata(request.doc_id)
         if not doc_metadata:
             raise ValidationException(
                 "Document not found",
@@ -338,7 +303,7 @@ async def document_query(request: DocumentQueryRequest):
         
         # Store user message in STM
         document_workflow.memory_manager.store_message(
-            request.session_id,
+            request.doc_id,
             "user",
             request.question
         )
@@ -347,7 +312,6 @@ async def document_query(request: DocumentQueryRequest):
         initial_state = {
             "messages": [HumanMessage(content=request.question)],
             "doc_id": request.doc_id,
-            "session_id": request.session_id,
             "user_id": request.user_id,
             "retrieved_chunks": [],
             "sources": [],
@@ -373,7 +337,7 @@ async def document_query(request: DocumentQueryRequest):
         
         # Store Q&A in LTM
         doc_session_manager.store_document_qa(
-            session_id=request.session_id,
+            #session_id=request.session_id,
             doc_id=request.doc_id,
             user_id=request.user_id,
             question=request.question,
@@ -388,7 +352,8 @@ async def document_query(request: DocumentQueryRequest):
         
         return QueryResponse(
             answer=answer,
-            session_id=request.session_id,
+            #session_id=request.session_id,
+            doc_id=request.doc_id,
             message_id=f"msg_{int(datetime.now().timestamp() * 1000)}",
             timestamp=datetime.now().isoformat(),
             sources=sources,
@@ -595,28 +560,29 @@ async def internet_query_batch(requests: List[InternetQueryRequest]):
 
 
 @app.get("/get-user-documents")
-#@log_execution_time
 async def get_user_documents(user_id: str = "static_test_user"):
-    """Get all documents for user"""
     try:
-        logger.info(f"[GET DOCS] Fetching documents for user: {user_id}")
-        
-        documents = doc_session_manager.get_user_documents(user_id, limit=100)
-        
+        logger.info(f"[GET DOCS] Fetching documents for: {user_id}")
+
+        rows = postgres_manager.get_user_documents(user_id)
+
+        documents = []
+        for row in rows:
+            documents.append({
+                "id": str(row["doc_id"]),                     # Convert UUID → str
+                "name": row["filename"],
+                "uploadedAt": row["uploaded_at"].isoformat(),  # Correct timestamp
+                "size": f"{row['size_bytes']/1024:.1f} KB",
+                "page_count": row["page_count"],
+                "has_tables": row["has_tables"],
+                "has_charts": row["has_charts"],
+            })
+
         return {
-            "documents": [
-                {
-                    "id": doc['doc_id'],
-                    "name": doc['filename'],
-                    "uploadedAt": doc['upload_timestamp'],
-                    "size": f"{doc.get('page_count', 0)} pages",
-                    "page_count": doc.get('page_count', 0)
-                }
-                for doc in documents
-            ],
+            "documents": documents,
             "count": len(documents)
         }
-        
+
     except Exception as e:
         logger.error(f"[GET DOCS] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -626,7 +592,7 @@ async def get_user_documents(user_id: str = "static_test_user"):
 async def get_document_summary(doc_id: str):
     """Get conversation summary for document"""
     try:
-        validate_doc_id(doc_id)
+        #validate_doc_id(doc_id)
         
         logger.info(f"[GET SUMMARY] Doc: {doc_id}")
         

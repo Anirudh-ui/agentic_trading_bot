@@ -7,7 +7,7 @@ load_dotenv()
 NER_API_KEY = os.getenv("NER_API_KEY")
 genai.configure(api_key=NER_API_KEY)
 
-model = genai.GenerativeModel("gemini-2.5-flash")
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 
 def extract_entities_with_gemini(text: str) -> dict:

@@ -1,63 +1,85 @@
-# ========================
+##############################
 # LANGCHAIN 0.3 ECOSYSTEM
-# ========================
+##############################
 langchain==0.3.27
 langchain-core==0.3.76
 langchain-community==0.3.29
-langchain-google-genai==2.1.10
+langchain-text-splitters==0.3.9
+langchain-google-genai
 langchain-groq==0.3.7
+langchain-pinecone==0.2.3
+langchain-tavily
+##############################
+# PDF / DOC PROCESSING
+##############################
+pymupdf
+python-docx
 
+##############################
+# GOOGLE / GEMINI
+##############################
+google-generativeai
 
-# ========================
-# VECTORS / MEMORY
-# ========================
-pinecone
-weaviate-client
-redis
+##############################
+# LANGGRAPH
+##############################
+langgraph==0.2.34
+
+##############################
+# VECTOR STORES / MEMORY
+##############################
 faiss-cpu
+redis
+weaviate-client
+pinecone==5.4.2
 
-# ========================
+##############################
 # LLM / EMBEDDINGS / NLP
-# ========================
-
+##############################
 transformers
-
-pydantic==2.12.5
+sentence-transformers
+tiktoken
+pydantic==2.9.2
 python-dateutil
 
-# ========================
+##############################
 # SEARCH / FINANCE
-# ========================
+##############################
 tavily-python==0.7.13
 yfinance>=0.2.40
 polygon==1.2.8
 requests==2.32.5
 tenacity>=8.2.0
 
-# ========================
-# UTILITIES
-# ========================
+##############################
+# PDF / DOC PROCESSING
+##############################
 pypdf
+pdfplumber==0.10.3
+pdf2image
 pyyaml
 python-dotenv
-pdf2image
-pdftotext
 spacy
 
-# ========================
-# SERVER / API
-# ========================
+##############################
+# SERVER
+##############################
 fastapi==0.110.0
 uvicorn==0.30.3
 
-# ========================
+##############################
 # ML / DATA
-# ========================
-scikit-learn>=1.3.0
+##############################
 numpy
 pandas
+scikit-learn>=1.3.0
 
-# ========================
-# STREAMLIT (if used)
-# =
+##############################
+# STREAMLIT
+##############################
 streamlit==1.30.0
+
+##############################
+# DATABASES
+##############################
+psycopg2-binary

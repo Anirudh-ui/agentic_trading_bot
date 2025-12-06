@@ -247,20 +247,18 @@ class RedisMemoryManager:
         self.redis.expire(key, self.ttl_seconds)
 
 # ==================== REDIS (DOCUMENT STM) ====================
+# ==================== REDIS (DOCUMENT STM WITH SUMMARIZATION) ====================
 
 class RedisMemoryManager_document:
-    """for document storage in redis (STM for doc conversations)"""
+    """
+    Short-term memory for document chats.
+    Includes:
+    - Message storage (Redis)
+    - Automatic summarization using ConversationSummaryBuffer
+    - Metadata tracking
+    """
 
     def __init__(self, host='localhost', port=6380, db=1, ttl_hours=24):
-        """
-        Initialize Redis connection
-
-        Args:
-            host: Redis host
-            port: Redis port
-            db: Redis database number
-            ttl_hours: Time-to-live for session data in hours
-        """
         self.redis_client = redis.Redis(
             host=host,
             port=port,
@@ -269,440 +267,223 @@ class RedisMemoryManager_document:
         )
         self.ttl_seconds = ttl_hours * 3600
 
-    def _get_session_key(self, session_id: str) -> str:
-        """Generate Redis key for session"""
-        return f"session:{session_id}"
+        # Create summarizer (REQUIRED)
+        llm = ModelLoader().load_llm()
+        self.summary_buffer = ConversationSummaryBuffer(llm)
 
-    def _get_messages_key(self, session_id: str) -> str:
-        """Generate Redis key for messages"""
-        return f"messages:{session_id}"
+    # ------------------ Redis Key Generators ------------------
+    
+    def _get_messages_key(self, doc_id: str) -> str:
+        return f"messages:{doc_id}"
 
-    def _get_metadata_key(self, session_id: str) -> str:
-        """Generate Redis key for session metadata"""
-        return f"metadata:{session_id}"
+    def _get_summary_key(self, doc_id: str) -> str:
+        return f"summary:{doc_id}"
 
-    def store_message(self, session_id: str, message: Dict):
+    def _get_metadata_key(self, doc_id: str) -> str:
+        return f"metadata:{doc_id}"
+
+    # ------------------ Store Message ------------------
+
+    def store_message(self, doc_id: str, message: Dict):
         """
-        Store a single message in Redis
+        Store a message in Redis STM.
+        Auto-summarize when needed.
         """
         try:
-            key = self._get_messages_key(session_id)
+            key = self._get_messages_key(doc_id)
+            message["timestamp"] = datetime.now().isoformat()
 
-            message['timestamp'] = datetime.now().isoformat()
-
+            # Save raw message
             self.redis_client.rpush(key, json.dumps(message))
             self.redis_client.expire(key, self.ttl_seconds)
 
-            self._update_session_metadata(session_id)
+            # Update metadata
+            self._update_metadata(doc_id)
+
+            # Attempt summarization
+            self._maybe_summarize_and_prune(doc_id)
 
         except Exception as e:
-            print(f"Error storing message in Redis (doc): {e}")
+            print(f"[REDIS_DOC] Error storing message: {e}")
 
-    def get_messages(self, session_id: str, limit: Optional[int] = None) -> List[Dict]:
+    # ------------------ Summarization Logic ------------------
+
+    def _maybe_summarize_and_prune(self, doc_id: str):
         """
-        Retrieve conversation history from Redis
+        Summarize last N messages and prune excess.
+        Stores the summary separately under summary:{doc_id}.
         """
         try:
-            key = self._get_messages_key(session_id)
+            messages = self.get_messages(doc_id)
 
-            if limit:
-                messages = self.redis_client.lrange(key, -limit, -1)
-            else:
-                messages = self.redis_client.lrange(key, 0, -1)
+            # Let buffer decide if summary is needed
+            if not self.summary_buffer.should_summarize(messages):
+                return
 
-            return [json.loads(msg) for msg in messages]
+            result = self.summary_buffer.summarize_and_prune(messages)
+
+            # Save the summary
+            summary_text = result["summary"]
+            self.redis_client.set(self._get_summary_key(doc_id), summary_text, ex=self.ttl_seconds)
+
+            # Replace messages with trimmed set
+            key = self._get_messages_key(doc_id)
+            self.redis_client.delete(key)
+
+            for msg in result["trimmed_messages"]:
+                self.redis_client.rpush(key, json.dumps(msg))
+
+            self.redis_client.expire(key, self.ttl_seconds)
 
         except Exception as e:
-            print(f"Error retrieving messages from Redis (doc): {e}")
+            print(f"[REDIS_DOC] Error summarizing/pruning: {e}")
+
+    # ------------------ Retrieval ------------------
+
+    def get_messages(self, doc_id: str, limit: Optional[int] = None) -> List[Dict]:
+        try:
+            key = self._get_messages_key(doc_id)
+            raw = self.redis_client.lrange(key, -limit, -1) if limit else self.redis_client.lrange(key, 0, -1)
+            return [json.loads(m) for m in raw]
+        except Exception as e:
+            print(f"[REDIS_DOC] Error retrieving messages: {e}")
             return []
 
-    def get_langchain_messages(self, session_id: str, limit: Optional[int] = 10):
-        """
-        Get messages in LangChain format
-        """
-        messages = self.get_messages(session_id, limit)
-        langchain_messages = []
+    def get_langchain_messages(self, doc_id: str, limit: int = 10):
+        msgs = self.get_messages(doc_id, limit)
+        out = []
 
-        for msg in messages:
-            role = msg.get('role')
-            content = msg.get('content', '')
+        for m in msgs:
+            role = m.get("role")
+            content = m.get("content", "")
 
-            if role == 'user':
-                langchain_messages.append(HumanMessage(content=content))
-            elif role == 'assistant' or role == 'bot':
-                langchain_messages.append(AIMessage(content=content))
-            elif role == 'system':
-                langchain_messages.append(SystemMessage(content=content))
+            if role == "user":
+                out.append(HumanMessage(content=content))
+            elif role == "assistant" or role == "bot":
+                out.append(AIMessage(content=content))
+            elif role == "summary":
+                out.append(SystemMessage(content=f"(Summary) {content}"))
 
-        return langchain_messages
+        return out
 
-    def _update_session_metadata(self, session_id: str):
-        """Update session metadata (last activity, message count)"""
+    def get_summary(self, doc_id: str):
+        return self.redis_client.get(self._get_summary_key(doc_id))
+
+    # ------------------ Metadata ------------------
+
+    def _update_metadata(self, doc_id):
         try:
-            key = self._get_metadata_key(session_id)
-            messages_key = self._get_messages_key(session_id)
+            key = self._get_metadata_key(doc_id)
+            messages_key = self._get_messages_key(doc_id)
 
             metadata = {
-                'last_activity': datetime.now().isoformat(),
-                'message_count': self.redis_client.llen(messages_key),
-                'session_id': session_id
+                "last_activity": datetime.now().isoformat(),
+                "message_count": self.redis_client.llen(messages_key),
+                "doc_id": doc_id
             }
 
             self.redis_client.set(key, json.dumps(metadata), ex=self.ttl_seconds)
 
         except Exception as e:
-            print(f"Error updating session metadata (doc): {e}")
+            print(f"[REDIS_DOC] Error updating metadata: {e}")
 
-    def get_session_metadata(self, session_id: str) -> Optional[Dict]:
-        """Get session metadata"""
+    def get_session_metadata(self, doc_id: str) -> Optional[Dict]:
         try:
-            key = self._get_metadata_key(session_id)
-            data = self.redis_client.get(key)
-            return json.loads(data) if data else None
-        except Exception as e:
-            print(f"Error getting session metadata (doc): {e}")
+            meta = self.redis_client.get(self._get_metadata_key(doc_id))
+            return json.loads(meta) if meta else None
+        except:
             return None
 
-    def clear_session(self, session_id: str):
-        """Clear all data for a session"""
+    # ------------------ Clear Session ------------------
+
+    def clear_session(self, doc_id: str):
         try:
-            keys = [
-                self._get_messages_key(session_id),
-                self._get_metadata_key(session_id),
-                self._get_session_key(session_id)
-            ]
-            self.redis_client.delete(*keys)
+            self.redis_client.delete(self._get_messages_key(doc_id))
+            self.redis_client.delete(self._get_summary_key(doc_id))
+            self.redis_client.delete(self._get_metadata_key(doc_id))
         except Exception as e:
-            print(f"Error clearing session (doc): {e}")
+            print(f"[REDIS_DOC] Error clearing session: {e}")
 
-    def get_active_sessions(self) -> List[str]:
-        """Get list of active session IDs"""
-        try:
-            pattern = "metadata:*"
-            keys = self.redis_client.keys(pattern)
-            return [key.split(':')[1] for key in keys]
-        except Exception as e:
-            print(f"Error getting active sessions (doc): {e}")
-            return []
-    def save_message(self, session_id: str, role: str, content: str):
-        key = f"session:{session_id}:messages"
-        msg = {"role": role, "content": content, "time": datetime.now().isoformat()}
 
-        self.redis.rpush(key, json.dumps(msg))
-        print(f"[REDIS][STORE] {session_id} {role}: '{content[:60]}'")
-
-        # Run summarization + pruning check
-        self.summary_buffer.process_and_prune(session_id)
-
-    # Load STM messages (parsed)
-    def load_messages(self, session_id: str):
-        key = f"session:{session_id}:messages"
-        raw = self.redis.lrange(key, 0, -1)
-        return [json.loads(m) for m in raw]
-
-    # Load summary (string)
-    def load_summary(self, session_id: str):
-        key = f"session:{session_id}:summary"
-        return self.redis.get(key)
-
-    # Clear session (on chat panel close)
-    def clear_session(self, session_id: str):
-        print(f"[REDIS][CLEAR] Full clear for {session_id}")
-        self.redis.delete(f"session:{session_id}:messages")
-        self.redis.delete(f"session:{session_id}:summary")
-
-# ==================== WEAVIATE LTM ====================
+# ==================== WEAVIATE (DOCUMENT LTM USING doc_id) ====================
 
 class WeaviateMemoryManager:
-    """Manages long-term memory using Weaviate"""
-    
+    """Long-term document memory manager"""
+
     def __init__(self, url: str, api_key: Optional[str] = None):
-        """
-        Initialize Weaviate connection
-        
-        Args:
-            url: Weaviate instance URL
-            api_key: Optional API key for Weaviate Cloud
-        """
+        # Connection logic preserved
         if api_key:
             self.client = weaviate.connect_to_weaviate_cloud(
                 cluster_url=url,
                 auth_credentials=Auth.api_key(api_key)
             )
         else:
-            #self.client = weaviate.connect_to_local(host="localhost",port=8080)
             try:
                 parts = url.split("://")[-1].split(":")
                 host = parts[0]
                 port = int(parts[1])
                 self.client = weaviate.connect_to_local(host=host, port=port)
-            except Exception as e:
-                # Fallback connection logic
-                print(f"[WEAVIATE ERROR] Could not parse URL {url} or connect: {e}")
-                self.client = weaviate.connect_to_local(host="localhost",port=8080)
-        
+            except:
+                self.client = weaviate.connect_to_local(host="localhost", port=8080)
+
         self._setup_schema()
+
     def _setup_schema(self):
-        """Create Weaviate schema for conversation memory"""
+        """Ensure ConversationMemory schema exists"""
         try:
-            # 1. ConversationMemory Collection
             if not self.client.collections.exists("ConversationMemory"):
-                
-                # Correct V4 syntax for property definitions
-                memory_properties = [
-                    Property(name="session_id", data_type=DataType.TEXT, description="Unique session identifier"),
-                    Property(name="user_id", data_type=DataType.TEXT, description="User identifier (if available)"),
-                    Property(name="summary", data_type=DataType.TEXT, description="Conversation summary"),
-                    Property(name="key_topics", data_type=DataType.TEXT_ARRAY, description="Main topics discussed"),
-                    Property(name="user_preferences", data_type=DataType.TEXT, description="User preferences as JSON"),
-                    Property(name="timestamp", data_type=DataType.DATE, description="When conversation occurred"),
-                    Property(name="message_count", data_type=DataType.INT, description="Number of messages in conversation")
-                ]
-                
                 self.client.collections.create(
                     name="ConversationMemory",
-                    properties=memory_properties
-                    # Vectorizer is likely set via environment variables if omitted here
+                    properties=[
+                        Property(name="doc_id", data_type=DataType.TEXT),
+                        Property(name="summary", data_type=DataType.TEXT),
+                        Property(name="key_topics", data_type=DataType.TEXT_ARRAY),
+                        Property(name="timestamp", data_type=DataType.DATE),
+                        Property(name="message_count", data_type=DataType.INT),
+                    ]
                 )
-            
-            # 2. UserProfile Collection
-            if not self.client.collections.exists("UserProfile"):
-                
-                # Correct V4 syntax for property definitions
-                profile_properties = [
-                    Property(name="user_id", data_type=DataType.TEXT, description="Unique user identifier"),
-                    Property(name="name", data_type=DataType.TEXT, description="User's name"),
-                    Property(name="preferences", data_type=DataType.TEXT, description="User preferences as JSON"),
-                    Property(name="favorite_stocks", data_type=DataType.TEXT_ARRAY, description="User's favorite stock tickers"),
-                    Property(name="trading_goals", data_type=DataType.TEXT, description="User's trading goals"),
-                    Property(name="last_updated", data_type=DataType.DATE, description="Last profile update")
-                ]
-
-                self.client.collections.create(
-                    name="UserProfile",
-                    properties=profile_properties
-                )
-                
         except Exception as e:
-            print(f"Error setting up Weaviate schema: {e}")
+            print(f"[WEAVIATE] Schema setup error: {e}")
+
     def store_conversation_summary(
         self,
-        session_id: str,
+        doc_id: str,
         summary: str,
         key_topics: List[str],
-        user_preferences: Dict,
-        message_count: int,
-        user_id: Optional[str] = None
+        message_count: int
     ):
-        """
-        Store conversation summary in Weaviate for long-term memory
-        
-        Args:
-            session_id: Session identifier
-            summary: Conversation summary
-            key_topics: List of main topics discussed
-            user_preferences: User preferences extracted from conversation
-            message_count: Number of messages in the conversation
-            user_id: Optional user identifier
-        """
-        now_utc = datetime.now(timezone.utc)
-        timestamp_string = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        """Stores document chat summary in LTM"""
+
+        timestamp_string = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+
         try:
             collection = self.client.collections.get("ConversationMemory")
-            
             collection.data.insert(
                 properties={
-                    "session_id": session_id,
-                    "user_id": user_id or "anonymous",
+                    "doc_id": doc_id,
                     "summary": summary,
                     "key_topics": key_topics,
-                    "user_preferences": json.dumps(user_preferences),
                     "timestamp": timestamp_string,
                     "message_count": message_count
                 }
             )
-            
         except Exception as e:
-            print(f"Error storing conversation summary in Weaviate: {e}")
-    
-    def get_user_conversation_history(
-        self,
-        user_id: str,
-        limit: int = 10
-    ) -> List[Dict]:
-        """
-        Retrieve user's conversation history from long-term memory
-        
-        Args:
-            user_id: User identifier
-            limit: Maximum number of conversations to retrieve
-            
-        Returns:
-            List of conversation summaries
-        """
-        try:
-            collection = self.client.collections.get("ConversationMemory")
-            """{
-                    "path": ["user_id"],
-                    "operator": "Equal",
-                    "valueText": user_id
-                }"""
-            response = collection.query.fetch_objects(
-                filters=Filter.by_property("user_id").equal(user_id),
-                limit=limit
-            )
-            
-            results = []
-            for item in response.objects:
-                results.append({
-                    "session_id": item.properties.get("session_id"),
-                    "summary": item.properties.get("summary"),
-                    "key_topics": item.properties.get("key_topics"),
-                    "timestamp": item.properties.get("timestamp"),
-                    "message_count": item.properties.get("message_count")
-                })
-            
-            return results
-            
-        except Exception as e:
-            print(f"Error retrieving conversation history from Weaviate: {e}")
-            return []
-    
-    def search_conversations(self, query: str, limit: int = 5) -> List[Dict]:
-        """
-        Search through conversation summaries
-        
-        Args:
-            query: Search query
-            limit: Maximum results
-            
-        Returns:
-            List of relevant conversation summaries
-        """
-        try:
-            collection = self.client.collections.get("ConversationMemory")
-            
-            response = collection.query.near_text(
-                query=query,
-                limit=limit
-            )
-            
-            results = []
-            for item in response.objects:
-                results.append({
-                    "session_id": item.properties.get("session_id"),
-                    "summary": item.properties.get("summary"),
-                    "key_topics": item.properties.get("key_topics"),
-                    "relevance_score": item.metadata.distance
-                })
-            
-            return results
-            
-        except Exception as e:
-            print(f"Error searching conversations in Weaviate: {e}")
-            return []
-    
-    def update_user_profile(
-        self,
-        user_id: str,
-        name: Optional[str] = None,
-        preferences: Optional[Dict] = None,
-        favorite_stocks: Optional[List[str]] = None,
-        trading_goals: Optional[str] = None
-    ):
-        """
-        Update or create user profile
-        
-        Args:
-            user_id: User identifier
-            name: User's name
-            preferences: User preferences
-            favorite_stocks: List of favorite stock tickers
-            trading_goals: User's trading goals
-        """
-        try:
-            collection = self.client.collections.get("UserProfile")
-            
-            # Check if profile exists
-            """{
-                    "path": ["user_id"],
-                    "operator": "Equal",
-                    "valueText": user_id
-                }"""
-            existing = collection.query.fetch_objects(
-                filters=Filter.by_property("user_id").equal(user_id),
-                limit=1
-            )
-            
-            properties = {
-                "user_id": user_id,
-                "last_updated": datetime.now().isoformat()
-            }
-            
-            if name:
-                properties["name"] = name
-            if preferences:
-                properties["preferences"] = json.dumps(preferences)
-            if favorite_stocks:
-                properties["favorite_stocks"] = favorite_stocks
-            if trading_goals:
-                properties["trading_goals"] = trading_goals
-            
-            if existing.objects:
-                # Update existing profile
-                collection.data.update(
-                    uuid=existing.objects[0].uuid,
-                    properties=properties
-                )
-            else:
-                # Create new profile
-                collection.data.insert(properties=properties)
-                
-        except Exception as e:
-            print(f"Error updating user profile in Weaviate: {e}")
-    
-    def get_user_profile(self, user_id: str) -> Optional[Dict]:
-        """Get user profile from Weaviate"""
-        try:
-            collection = self.client.collections.get("UserProfile")
-            """{
-                    "path": ["user_id"],
-                    "operator": "Equal",
-                    "valueText": user_id
-                }"""
-            response = collection.query.fetch_objects(
-                filters=Filter.by_property("user_id").equal(user_id),
-                limit=1
-            )
-            
-            if response.objects:
-                props = response.objects[0].properties
-                return {
-                    "user_id": props.get("user_id"),
-                    "name": props.get("name"),
-                    "preferences": json.loads(props.get("preferences", "{}")),
-                    "favorite_stocks": props.get("favorite_stocks", []),
-                    "trading_goals": props.get("trading_goals"),
-                    "last_updated": props.get("last_updated")
-                }
-            
-            return None
-            
-        except Exception as e:
-            print(f"Error getting user profile from Weaviate: {e}")
-            return None
-    
+            print(f"[WEAVIATE] Error storing LTM summary: {e}")
+
     def close(self):
-        """Close Weaviate connection"""
         try:
             self.client.close()
-        except Exception as e:
-            print(f"Error closing Weaviate connection: {e}")
-# ==================== HYBRID (DOC STM + LTM) ====================
+        except:
+            pass
+
+
+# ==================== HYBRID MEMORY (DOCUMENT STM + LTM) ====================
 
 class HybridMemoryManager:
     """
-    Unified memory manager combining Redis (short-term) and Weaviate (long-term)
+    Combines:
+    Redis (STM)
+    Weaviate (LTM)
     """
 
     def __init__(
@@ -723,53 +504,33 @@ class HybridMemoryManager:
             api_key=weaviate_api_key
         )
 
-    def store_message(self, session_id: str, role: str, content: str):
-        """Store message in short-term memory (Redis)"""
-        message = {"role": role, "content": content}
-        self.redis_manager.store_message(session_id, message)
+    # ------------------ STM ------------------
 
-    def get_short_term_memory(self, session_id: str, limit: int = 10):
-        """Get recent conversation from Redis"""
-        return self.redis_manager.get_langchain_messages(session_id, limit)
+    def store_message(self, doc_id: str, role: str, content: str):
+        msg = {"role": role, "content": content}
+        self.redis_manager.store_message(doc_id, msg)
+
+    def get_short_term_memory(self, doc_id: str, limit: int = 10):
+        return self.redis_manager.get_langchain_messages(doc_id, limit)
+
+    # ------------------ LTM ------------------
 
     def archive_conversation(
         self,
-        session_id: str,
+        doc_id: str,
         summary: str,
-        key_topics: List[str],
-        user_preferences: Dict,
-        user_id: Optional[str] = None
+        key_topics: List[str]
     ):
-        """
-        Archive conversation from Redis to Weaviate for long-term storage
-        """
-        metadata = self.redis_manager.get_session_metadata(session_id)
-        message_count = metadata.get('message_count', 0) if metadata else 0
+        metadata = self.redis_manager.get_session_metadata(doc_id)
+        message_count = metadata.get("message_count", 0) if metadata else 0
 
         self.weaviate_manager.store_conversation_summary(
-            session_id=session_id,
+            doc_id=doc_id,
             summary=summary,
             key_topics=key_topics,
-            user_preferences=user_preferences,
-            message_count=message_count,
-            user_id=user_id
+            message_count=message_count
         )
 
-    def get_long_term_context(self, user_id: str, limit: int = 5) -> str:
-        """
-        Get long-term conversation context for a user
-        """
-        history = self.weaviate_manager.get_user_conversation_history(user_id, limit)
-
-        if not history:
-            return "No previous conversation history."
-
-        context = "Previous conversations:\n"
-        for conv in history:
-            context += f"- {conv['summary']} (Topics: {', '.join(conv['key_topics'])})\n"
-
-        return context
-
     def close(self):
-        """Close all connections"""
         self.weaviate_manager.close()
+

@@ -75,6 +75,24 @@ export default function App() {
       console.error('[LOAD DOCS] Error:', error);
     }
   };
+  // Create backend session for a document
+const createSessionForDocument = async (docId: string) => {
+  try {
+    const resp = await fetch(`${API_BASE_URL}/document-session/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ doc_id: docId })
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Failed to create session");
+
+    return data.session_id;
+  } catch (err) {
+    console.error("[SESSION CREATE] Error:", err);
+    return null;
+  }
+};
 
   const handleDocumentUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -140,7 +158,8 @@ export default function App() {
       // Auto-select
       setSelectedDocument(newDocument);
       setDocumentMessages([]);
-      setDocumentSessionId(newDocument.id); // Session ID = doc_id
+      const newSession = await createSessionForDocument(newDocument.id);
+      setDocumentSessionId(newSession); // Session ID = doc_id
       
       // Show document info
       if (uploadedDoc.is_first_time) {
@@ -164,31 +183,38 @@ export default function App() {
     }
   };
 
-  const handleDocumentSelect = async (doc: Document) => {
-    if (isDocLoading) return; // Prevent selection during loading
-    
-    setSelectedDocument(doc);
+  const handleDocumentSelect = async (doc: Document | null) => {
+  if (isDocLoading) return;
+
+  if (!doc) {
+    setSelectedDocument(null);
     setDocumentMessages([]);
-    setDocumentSessionId(doc.id);
-    
-    console.log('[SELECT] Document:', doc.id);
-    
-    // Load document summary
-    try {
-      const response = await fetch(`${API_BASE_URL}/get-document-summary/${doc.id}`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.has_history) {
-          setDocumentSummary(data.summary || 'Previous conversations available');
-        } else {
-          setDocumentSummary('No previous conversations. Ask your first question!');
-        }
-      }
-    } catch (error) {
-      console.error('[SUMMARY] Error:', error);
-      setDocumentSummary('Ready to answer questions about this document.');
-    }
-  };
+    setDocumentSummary('');
+    setDocumentSessionId('');
+    return;
+  }
+
+  setSelectedDocument(doc);
+  setDocumentMessages([]);
+
+  console.log("[SELECT] Document:", doc.id);
+
+  // 1️⃣ Create session for this doc
+  const sessionId = await createSessionForDocument(doc.id);
+  setDocumentSessionId(sessionId);
+
+  // 2️⃣ Load doc history: summary + has_history
+  const resp = await fetch(`${API_BASE_URL}/document-history/${doc.id}`);
+  const data = await resp.json();
+
+  if (!data.has_history) {
+    setDocumentSummary("You are interacting with this document for the first time.");
+    return;
+  }
+
+  setDocumentSummary(data.summary || "Previous summary available");
+};
+
 
   const handleSendDocumentMessage = async (text: string) => {
     if (!selectedDocument || isDocLoading) return;
@@ -205,7 +231,21 @@ export default function App() {
 
     try {
       console.log('[DOC QUERY] Sending:', text.substring(0, 50));
-      
+      // ✅ SESSION ID SAFETY CHECK — PLACE IT HERE
+    if (!documentSessionId) {
+      console.error("No session ID for document.");
+      setDocumentMessages(prev => [
+        ...prev,
+        {
+          id: `error_${Date.now()}`,
+          text: "No session available. Try re-selecting the document.",
+          sender: 'bot',
+          timestamp: new Date(),
+        }
+      ]);
+      setIsDocLoading(false);
+      return;
+    }
       const response = await fetch(`${API_BASE_URL}/document-query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -318,7 +358,35 @@ export default function App() {
       setIsGenLoading(false);
     }
   };
+  const handleDeleteDocument = async (docId: string) => {
+    const confirmDelete = window.confirm("Are you sure you want to delete this document?");
+    if (!confirmDelete) return;
 
+    try {
+      const response = await fetch(`${API_BASE_URL}/delete-document/${docId}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to delete document");
+      }
+
+      // Remove from UI
+      setDocuments(prev => prev.filter(d => d.id !== docId));
+
+      // Reset UI if deleted doc was selected
+      if (selectedDocument?.id === docId) {
+        setSelectedDocument(null);
+        setDocumentMessages([]);
+        setDocumentSummary('');
+      }
+
+    } catch (error) {
+      console.error("DELETE ERROR:", error);
+      alert("Failed to delete. Try again.");
+    }
+  };
+ 
   const handleCloseGeneralChat = async () => {
     setIsClosing(true);
     
@@ -355,6 +423,7 @@ export default function App() {
           selectedDocument={selectedDocument}
           onDocumentUpload={handleDocumentUpload}
           onDocumentSelect={handleDocumentSelect}
+          onDocumentDelete={handleDeleteDocument}
           isUploading={isUploading}
           uploadProgress={uploadProgress}
         />

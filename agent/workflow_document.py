@@ -34,7 +34,7 @@ class DocumentState(TypedDict):
     """Enhanced state for two-LLM workflow"""
     messages: Annotated[list, add_messages]
     doc_id: str
-    session_id: str
+    #session_id: str
     user_id: str
     retrieved_chunks: list
     sources: list
@@ -436,7 +436,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
         """
         try:
             messages = state["messages"]
-            session_id = state.get("session_id", "default")
+            #session_id = state.get("session_id", "default")
             user_id = state.get("user_id", "anonymous")
             doc_id = state.get("doc_id", "")
             gemini_analysis = state.get("gemini_analysis", "No analysis available")
@@ -459,7 +459,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
                 return {"messages": [cached_response]}
             
             # Get conversation history (STM)
-            redis_history = self.memory_manager.get_short_term_memory(session_id, limit=5)
+            redis_history = self.memory_manager.get_short_term_memory(doc_id, limit=5)
             conversation_history = "\n".join([
                 f"{type(msg).__name__}: {msg.content[:100]}..."
                 for msg in redis_history[-3:]
@@ -486,7 +486,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
             
             # Store in STM
             if hasattr(groq_response, 'content'):
-                self.memory_manager.store_message(session_id, "assistant", groq_response.content)
+                self.memory_manager.store_message(doc_id, "assistant", groq_response.content)
             
             logger.info(f"[GROQ] Response generated | Length: {len(groq_response.content) if hasattr(groq_response, 'content') else 0}")
             
@@ -529,7 +529,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
         """
         try:
             messages = state["messages"]
-            session_id = state.get("session_id", "default")
+            #session_id = state.get("session_id", "default")
             user_id = state.get("user_id", "anonymous")
             doc_id = state.get("doc_id", "")
             
@@ -557,13 +557,13 @@ Generate a natural, conversational response based on the multimodal analysis pro
             })
             
             new_summary = new_summary_result['text'].strip()
-            logger.info(f"[SUMMARY] Updated for session: {session_id}")
+            logger.info(f"[SUMMARY] Updated for session: {doc_id}")
             
             # Archive to LTM if substantial (10+ messages)
             if len(conversational_messages) >= 10:
-                logger.info(f"[ARCHIVING] Archiving session {session_id} to LTM")
+                logger.info(f"[ARCHIVING] Archiving session {doc_id} to LTM")
                 self.memory_manager.archive_conversation(
-                    session_id=session_id,
+                    doc_id=doc_id,
                     summary=new_summary,
                     key_topics=['document', 'analysis', doc_id],
                     user_preferences={'doc_id': doc_id},

@@ -6,6 +6,7 @@ interface DocumentSidebarProps {
   selectedDocument: Document | null;
   onDocumentUpload: (files: FileList | null) => void;
   onDocumentSelect: (doc: Document) => void;
+  onDocumentDelete: (docId: string) => void;
   isUploading: boolean;
   uploadProgress?: string;
 }
@@ -15,6 +16,7 @@ export function DocumentSidebar({
   selectedDocument,
   onDocumentUpload,
   onDocumentSelect,
+  onDocumentDelete,
   isUploading,
   uploadProgress
 }: DocumentSidebarProps) {
@@ -23,7 +25,31 @@ export function DocumentSidebar({
       {/* Header */}
       <div className="p-4 lg:p-6 border-b border-gray-200 flex-shrink-0">
         <h2 className="text-xl font-bold text-gray-800 mb-4">Documents</h2>
-        
+        {/* Home Button */}
+  <button
+  onClick={() => onDocumentSelect(null)}
+  className="flex items-center justify-center gap-2 w-full px-4 py-3 
+             bg-blue-600 text-white rounded-lg hover:bg-blue-700 
+             transition-colors mb-4 shadow"
+>
+  {/* Home Icon - same style as Upload icon */}
+  <svg 
+    xmlns="http://www.w3.org/2000/svg" 
+    viewBox="0 0 24 24"
+    className="w-5 h-5 stroke-white"
+    fill="none"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M3 12L12 3l9 9" />
+    <path d="M9 21V12h6v9" />
+  </svg>
+
+  <span className="text-white font-medium">Home</span>
+</button>
+
+
         {/* Upload Button */}
         <label className={`flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 cursor-pointer transition-colors ${isUploading ? 'opacity-50 cursor-not-allowed' : ''}`}>
           {isUploading ? (
@@ -134,6 +160,37 @@ export function DocumentSidebar({
                       <FileCheck className="w-5 h-5 text-blue-600" />
                     </div>
                   )}
+                  {selectedDocument?.id === doc.id && (
+  <div className="flex items-center gap-2 flex-shrink-0">
+    
+    <button
+      onClick={(e) => {
+        e.stopPropagation();
+        onDocumentDelete(doc.id);
+      }}
+      className="text-red-500 hover:text-red-700 transition"
+      title="Delete document"
+    >
+      <svg
+        xmlns="http://www.w3.org/2000/svg"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="w-5 h-5"
+      >
+        <polyline points="3 6 5 6 21 6" />
+        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+        <path d="M10 11v6" />
+        <path d="M14 11v6" />
+        <path d="M9 6l1-2h4l1 2" />
+      </svg>
+    </button>
+  </div>
+)}
+
                 </div>
               </div>
             ))}

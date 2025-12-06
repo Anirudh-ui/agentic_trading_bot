@@ -110,7 +110,7 @@ class DocumentSessionManager:
                     name="DocumentQA",
                     properties=[
                         Property(name="doc_id", data_type=DataType.TEXT, description="Document ID"),
-                        Property(name="session_id", data_type=DataType.TEXT, description="Session ID"),
+                        Property(name="doc_id", data_type=DataType.TEXT, description="Session ID"),
                         Property(name="user_id", data_type=DataType.TEXT, description="User ID"),
                         Property(name="question", data_type=DataType.TEXT, description="User question"),
                         Property(name="answer", data_type=DataType.TEXT, description="Generated answer"),
@@ -342,7 +342,6 @@ class DocumentSessionManager:
     @log_execution_time
     def store_document_qa(
         self,
-        session_id: str,
         doc_id: str,
         user_id: str,
         question: str,
@@ -353,7 +352,7 @@ class DocumentSessionManager:
         Store Q&A interaction in Weaviate LTM
         
         Args:
-            session_id: Session ID
+            doc_id: Session ID
             doc_id: Document ID
             user_id: User ID
             question: User question
@@ -364,14 +363,13 @@ class DocumentSessionManager:
             now_utc = datetime.now(timezone.utc)
             timestamp = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
             
-            logger.info(f"[STORE Q&A] Doc: {doc_id} | Session: {session_id}")
+            logger.info(f"[STORE Q&A] Doc: {doc_id} | Session: {doc_id}")
             
             collection = self.weaviate_manager.client.collections.get("DocumentQA")
             
             collection.data.insert(
                 properties={
                     "doc_id": doc_id,
-                    "session_id": session_id,
                     "user_id": user_id,
                     "question": question,
                     "answer": answer,
