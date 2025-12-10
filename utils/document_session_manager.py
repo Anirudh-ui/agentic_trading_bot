@@ -27,7 +27,7 @@ from exception.exceptions import (
 class DocumentSessionManager:
     """
     Manages document sessions with enhanced features:
-    - Document metadata (Weaviate LTM)
+    - Document metadata (Weaviate LTM – legacy, Postgres is now source of truth)
     - Session management (Redis STM)
     - Q&A history (Weaviate LTM)
     - Duplicate prevention
@@ -53,7 +53,7 @@ class DocumentSessionManager:
         try:
             logger.info("[SESSION MANAGER] Initializing...")
             
-            # Redis for short-term memory
+            # Redis for short-term memory (document STM)
             self.redis_manager = RedisMemoryManager_document(
                 host=redis_host,
                 port=redis_port,
@@ -61,14 +61,14 @@ class DocumentSessionManager:
             )
             logger.info("[SESSION MANAGER] Redis connected")
             
-            # Weaviate for long-term memory
+            # Weaviate for long-term memory (Q&A + summary)
             self.weaviate_manager = WeaviateMemoryManager(
                 url=weaviate_url,
                 api_key=weaviate_api_key
             )
             logger.info("[SESSION MANAGER] Weaviate connected")
             
-            # Setup schemas
+            # Setup schemas (DocumentMetadata + DocumentQA)
             self._setup_schema()
             
             logger.info("[SESSION MANAGER] Initialization complete")
@@ -82,14 +82,14 @@ class DocumentSessionManager:
             )
     
     def _setup_schema(self):
-        """Setup Weaviate collections for document management"""
+        """Setup Weaviate collections for document management."""
         try:
             client = self.weaviate_manager.client
             if not client:
                 logger.error("[SCHEMA] Skipped — no Weaviate connection")
                 return
 
-            # ---------------- DocumentMetadata ----------------
+            # ---------------- DocumentMetadata (legacy – keep but unused) ----------------
             if not client.collections.exists("DocumentMetadata"):
                 client.collections.create(
                     name="DocumentMetadata",
@@ -107,7 +107,7 @@ class DocumentSessionManager:
                 )
                 logger.info("[SCHEMA] DocumentMetadata created")
 
-            # ---------------- DocumentQA ----------------
+            # ---------------- DocumentQA (doc-level Q&A) ----------------
             if not client.collections.exists("DocumentQA"):
                 client.collections.create(
                     name="DocumentQA",
@@ -130,7 +130,9 @@ class DocumentSessionManager:
                 component="schema"
             )
 
-
+    # -------------------------------------------------------------------------
+    # LEGACY METADATA HELPERS (Weaviate) – Postgres is now source of truth
+    # -------------------------------------------------------------------------
     
     @log_execution_time
     def register_document(
@@ -143,18 +145,9 @@ class DocumentSessionManager:
         has_charts: bool = False
     ) -> str:
         """
-        Register new document in Weaviate
-        
-        Args:
-            filename: Original filename
-            file_type: File extension (pdf, docx, etc)
-            user_id: User ID
-            page_count: Number of pages
-            has_tables: Whether document has tables
-            has_charts: Whether document has charts
-        
-        Returns:
-            Generated document ID (format: trade_doc_{hash})
+        Register new document in Weaviate (legacy metadata store).
+        Not used anymore as Postgres is the source of truth, but kept
+        for compatibility.
         """
         try:
             # Validate inputs
@@ -221,14 +214,8 @@ class DocumentSessionManager:
         user_id: str
     ) -> Optional[Dict]:
         """
-        Find existing document by filename (duplicate detection)
-        
-        Args:
-            filename: Original filename
-            user_id: User ID
-        
-        Returns:
-            Document metadata dict or None
+        Find existing document by filename (duplicate detection).
+        Legacy – you now use Postgres hash-based dedupe.
         """
         try:
             filename_hash = self._hash_filename(filename)
@@ -265,13 +252,8 @@ class DocumentSessionManager:
     @log_execution_time
     def get_document_metadata(self, doc_id: str) -> Optional[Dict]:
         """
-        Get document metadata
-        
-        Args:
-            doc_id: Document ID
-        
-        Returns:
-            Document metadata or None
+        Get document metadata from Weaviate (legacy).
+        Postgres is now the primary metadata store.
         """
         try:
             logger.info(f"[GET METADATA] Doc: {doc_id}")
@@ -304,14 +286,7 @@ class DocumentSessionManager:
     @log_execution_time
     def get_user_documents(self, user_id: str, limit: int = 50) -> List[Dict]:
         """
-        Get all documents for user
-        
-        Args:
-            user_id: User ID
-            limit: Maximum documents to return
-        
-        Returns:
-            List of document metadata
+        Get all documents for user from Weaviate (legacy).
         """
         try:
             logger.info(f"[GET USER DOCS] User: {user_id} | Limit: {limit}")
@@ -340,6 +315,10 @@ class DocumentSessionManager:
         except Exception as e:
             logger.error(f"[GET USER DOCS] Error: {e}")
             return []
+
+    # -------------------------------------------------------------------------
+    # Q&A STORAGE (Weaviate.DocumentQA) – used by main.py + workflow
+    # -------------------------------------------------------------------------
     
     @log_execution_time
     def store_document_qa(
@@ -351,21 +330,20 @@ class DocumentSessionManager:
         sources: List[Dict] = None
     ):
         """
-        Store Q&A interaction in Weaviate LTM
+        Store Q&A interaction in Weaviate LTM (DocumentQA).
         
         Args:
-            doc_id: Session ID
             doc_id: Document ID
             user_id: User ID
             question: User question
             answer: Generated answer
-            sources: Source citations
+            sources: Source citations (list of dicts)
         """
         try:
             now_utc = datetime.now(timezone.utc)
             timestamp = now_utc.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
             
-            logger.info(f"[STORE Q&A] Doc: {doc_id} | Session: {doc_id}")
+            logger.info(f"[STORE Q&A] Doc: {doc_id}")
             
             collection = self.weaviate_manager.client.collections.get("DocumentQA")
             
@@ -380,16 +358,101 @@ class DocumentSessionManager:
                 }
             )
             
-            logger.info(f"[STORE Q&A] Stored successfully")
+            logger.info("[STORE Q&A] Stored successfully")
             
         except Exception as e:
             logger.error(f"[STORE Q&A] Error: {e}")
             # Don't raise - Q&A storage is non-critical
-    
+
+    @log_execution_time
+    def get_last_document_qa(self, doc_id: str, limit: int = 3) -> List[Dict]:
+        """
+        Return last N Q&A pairs for a document from Weaviate.
+        Used by: /get-document-chat-preview
+        """
+        try:
+            logger.info(f"[GET LAST QA] Doc: {doc_id} | Limit: {limit}")
+            
+            # Use GraphQL-style query API for sorting by timestamp desc
+            result = (
+                self.weaviate_manager.client.query
+                .get("DocumentQA", ["question", "answer", "timestamp"])
+                .with_where({
+                    "path": ["doc_id"],
+                    "operator": "Equal",
+                    "valueString": doc_id
+                })
+                .with_sort([{
+                    "path": ["timestamp"],
+                    "order": "desc"
+                }])
+                .with_limit(limit)
+                .do()
+            )
+
+            items = (
+                result.get("data", {})
+                      .get("Get", {})
+                      .get("DocumentQA", [])
+            )
+
+            chats = [
+                {
+                    "question": qa.get("question", ""),
+                    "answer": qa.get("answer", ""),
+                    "timestamp": qa.get("timestamp", "")
+                }
+                for qa in items
+            ]
+
+            logger.info(f"[GET LAST QA] Retrieved {len(chats)} items")
+            return chats
+
+        except Exception as e:
+            logger.error(f"[GET LAST QA] Error: {e}")
+            return []
+
+    @log_execution_time
+    def get_document_qa_count(self, doc_id: str) -> int:
+        """
+        Count total number of Q&A rows for a document in Weaviate.
+        Used by: /get-document-chat-preview, /get-document-summary
+        """
+        try:
+            logger.info(f"[GET QA COUNT] Doc: {doc_id}")
+            
+            result = (
+                self.weaviate_manager.client.query
+                .aggregate("DocumentQA")
+                .with_where({
+                    "path": ["doc_id"],
+                    "operator": "Equal",
+                    "valueString": doc_id
+                })
+                .with_fields("meta { count }")
+                .do()
+            )
+
+            meta = (
+                result.get("data", {})
+                      .get("Aggregate", {})
+                      .get("DocumentQA", [{}])[0]
+                      .get("meta", {})
+            )
+            count = meta.get("count", 0)
+
+            logger.info(f"[GET QA COUNT] Count: {count}")
+            return count
+
+        except Exception as e:
+            logger.error(f"[GET QA COUNT] Error: {e}")
+            return 0
+
     @log_execution_time
     def get_document_summary(self, doc_id: str, limit: int = 5) -> Optional[str]:
         """
-        Get conversation summary for document
+        Get conversation summary for document.
+        Currently: lightweight summary built from recent Q&A in DocumentQA.
         
         Args:
             doc_id: Document ID
@@ -425,34 +488,74 @@ class DocumentSessionManager:
         except Exception as e:
             logger.error(f"[GET SUMMARY] Error: {e}")
             return None
-    
+
+    # -------------------------------------------------------------------------
+    # FULL CLEANUP – used by /delete-document/{doc_id}
+    # -------------------------------------------------------------------------
+
     @log_execution_time
-    def get_document_qa_count(self, doc_id: str) -> int:
+    def delete_document_history(self, doc_id: str):
         """
-        Get Q&A count for document
-        
-        Args:
-            doc_id: Document ID
-        
-        Returns:
-            Number of Q&As
+        Delete all memory for a given document:
+        - Redis STM messages
+        - Weaviate DocumentQA entries
+        - Weaviate ConversationMemory entries (if present)
+        - Weaviate DocumentMetadata entries (legacy)
         """
         try:
-            collection = self.weaviate_manager.client.collections.get("DocumentQA")
-            
-            response = collection.query.fetch_objects(
-                filters=Filter.by_property("doc_id").equal(doc_id),
-                limit=100
-            )
-            
-            count = len(response.objects)
-            logger.info(f"[GET QA COUNT] Doc: {doc_id} | Count: {count}")
-            
-            return count
-            
+            logger.info(f"[DELETE HISTORY] Doc: {doc_id}")
+
+            # 1) Clear STM from Redis
+            try:
+                self.redis_manager.clear_session(doc_id)
+                logger.info("[DELETE HISTORY] Redis STM cleared")
+            except Exception as e:
+                logger.warning(f"[DELETE HISTORY] Failed to clear Redis STM: {e}")
+
+            client = self.weaviate_manager.client
+            if not client:
+                logger.warning("[DELETE HISTORY] No Weaviate client. Skipping LTM delete.")
+                return
+
+            # 2) Delete from DocumentQA
+            try:
+                if client.collections.exists("DocumentQA"):
+                    qa_coll = client.collections.get("DocumentQA")
+                    qa_coll.data.delete_many(
+                        Filter.by_property("doc_id").equal(doc_id)
+                    )
+                    logger.info("[DELETE HISTORY] DocumentQA entries deleted")
+            except Exception as e:
+                logger.warning(f"[DELETE HISTORY] Failed to delete DocumentQA: {e}")
+
+            # 3) Delete from ConversationMemory (summaries), if collection exists
+            try:
+                if client.collections.exists("ConversationMemory"):
+                    conv_coll = client.collections.get("ConversationMemory")
+                    conv_coll.data.delete_many(
+                        Filter.by_property("doc_id").equal(doc_id)
+                    )
+                    logger.info("[DELETE HISTORY] ConversationMemory entries deleted")
+            except Exception as e:
+                logger.warning(f"[DELETE HISTORY] Failed to delete ConversationMemory: {e}")
+
+            # 4) Delete from DocumentMetadata (legacy mirror) if exists
+            try:
+                if client.collections.exists("DocumentMetadata"):
+                    meta_coll = client.collections.get("DocumentMetadata")
+                    meta_coll.data.delete_many(
+                        Filter.by_property("doc_id").equal(doc_id)
+                    )
+                    logger.info("[DELETE HISTORY] DocumentMetadata entries deleted")
+            except Exception as e:
+                logger.warning(f"[DELETE HISTORY] Failed to delete DocumentMetadata: {e}")
+
         except Exception as e:
-            logger.error(f"[GET QA COUNT] Error: {e}")
-            return 0
+            logger.error(f"[DELETE HISTORY] Error: {e}")
+
+    # -------------------------------------------------------------------------
+    # UTILITIES
+    # -------------------------------------------------------------------------
     
     def _generate_hash(self, filename: str, user_id: str) -> str:
         """
@@ -472,12 +575,6 @@ class DocumentSessionManager:
     def _hash_filename(self, filename: str) -> str:
         """
         Hash filename for duplicate detection
-        
-        Args:
-            filename: Filename
-        
-        Returns:
-            MD5 hash
         """
         return hashlib.md5(filename.encode()).hexdigest()
     
@@ -490,70 +587,6 @@ class DocumentSessionManager:
             logger.info("[SESSION MANAGER] Connections closed")
         except Exception as e:
             logger.error(f"[SESSION MANAGER] Error closing: {e}")
-
-    # Inside DocumentSessionManager
-
-def get_last_document_qa(self, doc_id: str, limit: int = 3):
-    """
-    Return last N Q&A pairs for a document from Weaviate.
-    Does NOT modify any existing functionality.
-    """
-    try:
-        result = (
-            self.weaviate_manager.client.query
-            .get("DocumentQA", ["question", "answer", "timestamp"])
-            .with_where({
-                "path": ["doc_id"],
-                "operator": "Equal",
-                "valueString": doc_id
-            })
-            .with_sort([{
-                "path": ["timestamp"],
-                "order": "desc"
-            }])
-            .with_limit(limit)
-            .do()
-        )
-
-        items = result.get("data", {}).get("Get", {}).get("DocumentQA", [])
-        return [
-            {"question": qa["question"], "answer": qa["answer"]}
-            for qa in items
-        ]
-    except Exception as e:
-        print(f"[Weaviate] get_last_document_qa failed: {e}")
-        return []
-
-
-def get_document_qa_count(self, doc_id: str) -> int:
-    """
-    Count total number of Q&A rows for a document in Weaviate.
-    Added safely without affecting existing workflow.
-    """
-    try:
-        result = (
-            self.weaviate_manager.client.query
-            .aggregate("DocumentQA")
-            .with_where({
-                "path": ["doc_id"],
-                "operator": "Equal",
-                "valueString": doc_id
-            })
-            .with_fields("meta { count }")
-            .do()
-        )
-
-        meta = (
-            result.get("data", {})
-                  .get("Aggregate", {})
-                  .get("DocumentQA", [{}])[0]
-                  .get("meta", {})
-        )
-        return meta.get("count", 0)
-
-    except Exception as e:
-        print(f"[Weaviate] get_document_qa_count failed: {e}")
-        return 0
 
 
 # Export

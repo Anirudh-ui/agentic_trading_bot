@@ -363,6 +363,44 @@ async def delete_document(doc_id: str):
         logger.error(f"[DELETE] Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/document-session/create")
+async def create_document_session(req: DocumentSessionCreateRequest):
+    try:
+        doc_id = req.doc_id
+        user_id = req.user_id
+
+        logger.info(f"[DOC SESSION] Creating session for doc_id={doc_id}")
+
+        # 1. Validate doc exists in Postgres
+        metadata = postgres_manager.get_document_metadata(doc_id)
+        if not metadata:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # 2. Create session id
+        session_id = f"doc_session_{doc_id}"
+
+        # 3. Initialize STM (Redis)
+        document_workflow.memory_manager.store_message(
+            session_id,
+            "system",
+            f"Document session started for {metadata['filename']}"
+        )
+
+        # 4. Get LTM summary (Weaviate)
+        summary = doc_session_manager.get_document_summary(doc_id)
+
+        logger.info(f"[DOC SESSION] Created session={session_id}")
+
+        return {
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "summary": summary or "",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"[DOC SESSION] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/document-query", response_model=QueryResponse)

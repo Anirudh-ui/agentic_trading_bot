@@ -21,6 +21,7 @@ import sys
 from dotenv import load_dotenv
 import json
 import time
+from custom_logging import logger
 from typing import List, Dict, Optional
 from utils.model_loaders import ModelLoader
 from utils.gemini_ner import extract_entities_with_gemini
@@ -251,315 +252,238 @@ class RedisMemoryManager:
 
 class RedisMemoryManager_document:
     """
-    Short-term memory for document chats.
-    Includes:
-    - Message storage (Redis)
-    - Automatic summarization using ConversationSummaryBuffer
-    - Metadata tracking
+    Short-term memory for document chat:
+    - Stores raw messages
+    - Prunes to keep last N
+    - Automatic summarization
     """
 
-    def __init__(self, host='localhost', port=6380, db=1, ttl_hours=24):
-        self.redis_client = redis.Redis(
-            host=host,
-            port=port,
-            db=db,
-            decode_responses=True
-        )
+    def __init__(self, host='localhost', port=6380, db=1, ttl_hours=48):
+        self.redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
         self.ttl_seconds = ttl_hours * 3600
+        self.llm = ModelLoader().load_llm()
+        self.summary_buffer = ConversationSummaryBuffer(self.llm)
 
-        # Create summarizer (REQUIRED)
-        llm = ModelLoader().load_llm()
-        self.summary_buffer = ConversationSummaryBuffer(llm)
+    def _key(self, doc_id): return f"messages:{doc_id}"
+    def _summary_key(self, doc_id): return f"summary:{doc_id}"
 
-    # ------------------ Redis Key Generators ------------------
-    
-    def _get_messages_key(self, doc_id: str) -> str:
-        return f"messages:{doc_id}"
+    def store_message(self, doc_id: str, message: dict):
+        key = self._key(doc_id)
+        message["timestamp"] = datetime.now().isoformat()
 
-    def _get_summary_key(self, doc_id: str) -> str:
-        return f"summary:{doc_id}"
+        self.redis.rpush(key, json.dumps(message))
+        self.redis.expire(key, self.ttl_seconds)
 
-    def _get_metadata_key(self, doc_id: str) -> str:
-        return f"metadata:{doc_id}"
+        self._maybe_summarize_and_prune(doc_id)
 
-    # ------------------ Store Message ------------------
+    def _maybe_summarize_and_prune(self, doc_id):
+        msgs = self.get_messages(doc_id)
 
-    def store_message(self, doc_id: str, message: Dict):
-        """
-        Store a message in Redis STM.
-        Auto-summarize when needed.
-        """
-        try:
-            key = self._get_messages_key(doc_id)
-            message["timestamp"] = datetime.now().isoformat()
+        if not self.summary_buffer.should_summarize(msgs):
+            return
 
-            # Save raw message
-            self.redis_client.rpush(key, json.dumps(message))
-            self.redis_client.expire(key, self.ttl_seconds)
+        result = self.summary_buffer.summarize_and_prune(msgs)
 
-            # Update metadata
-            self._update_metadata(doc_id)
+        # store rolling summary
+        self.redis.set(self._summary_key(doc_id), result["summary"], ex=self.ttl_seconds)
 
-            # Attempt summarization
-            self._maybe_summarize_and_prune(doc_id)
+        # rewrite STM memory
+        self.redis.delete(self._key(doc_id))
+        for m in result["trimmed_messages"]:
+            self.redis.rpush(self._key(doc_id), json.dumps(m))
 
-        except Exception as e:
-            print(f"[REDIS_DOC] Error storing message: {e}")
+    def get_messages(self, doc_id, limit=None):
+        raw = self.redis.lrange(self._key(doc_id), -limit, -1) if limit else \
+              self.redis.lrange(self._key(doc_id), 0, -1)
+        return [json.loads(r) for r in raw]
 
-    # ------------------ Summarization Logic ------------------
+    def get_summary(self, doc_id):
+        return self.redis.get(self._summary_key(doc_id))
 
-    def _maybe_summarize_and_prune(self, doc_id: str):
-        """
-        Summarize last N messages and prune excess.
-        Stores the summary separately under summary:{doc_id}.
-        """
-        try:
-            messages = self.get_messages(doc_id)
-
-            # Let buffer decide if summary is needed
-            if not self.summary_buffer.should_summarize(messages):
-                return
-
-            result = self.summary_buffer.summarize_and_prune(messages)
-
-            # Save the summary
-            summary_text = result["summary"]
-            self.redis_client.set(self._get_summary_key(doc_id), summary_text, ex=self.ttl_seconds)
-
-            # Replace messages with trimmed set
-            key = self._get_messages_key(doc_id)
-            self.redis_client.delete(key)
-
-            for msg in result["trimmed_messages"]:
-                self.redis_client.rpush(key, json.dumps(msg))
-
-            self.redis_client.expire(key, self.ttl_seconds)
-
-        except Exception as e:
-            print(f"[REDIS_DOC] Error summarizing/pruning: {e}")
-
-    # ------------------ Retrieval ------------------
-
-    def get_messages(self, doc_id: str, limit: Optional[int] = None) -> List[Dict]:
-        try:
-            key = self._get_messages_key(doc_id)
-            raw = self.redis_client.lrange(key, -limit, -1) if limit else self.redis_client.lrange(key, 0, -1)
-            return [json.loads(m) for m in raw]
-        except Exception as e:
-            print(f"[REDIS_DOC] Error retrieving messages: {e}")
-            return []
-
-    def get_langchain_messages(self, doc_id: str, limit: int = 10):
-        msgs = self.get_messages(doc_id, limit)
-        out = []
-
-        for m in msgs:
-            role = m.get("role")
-            content = m.get("content", "")
-
-            if role == "user":
-                out.append(HumanMessage(content=content))
-            elif role == "assistant" or role == "bot":
-                out.append(AIMessage(content=content))
-            elif role == "summary":
-                out.append(SystemMessage(content=f"(Summary) {content}"))
-
-        return out
-
-    def get_summary(self, doc_id: str):
-        return self.redis_client.get(self._get_summary_key(doc_id))
-
-    # ------------------ Metadata ------------------
-
-    def _update_metadata(self, doc_id):
-        try:
-            key = self._get_metadata_key(doc_id)
-            messages_key = self._get_messages_key(doc_id)
-
-            metadata = {
-                "last_activity": datetime.now().isoformat(),
-                "message_count": self.redis_client.llen(messages_key),
-                "doc_id": doc_id
-            }
-
-            self.redis_client.set(key, json.dumps(metadata), ex=self.ttl_seconds)
-
-        except Exception as e:
-            print(f"[REDIS_DOC] Error updating metadata: {e}")
-
-    def get_session_metadata(self, doc_id: str) -> Optional[Dict]:
-        try:
-            meta = self.redis_client.get(self._get_metadata_key(doc_id))
-            return json.loads(meta) if meta else None
-        except:
-            return None
-
-    # ------------------ Clear Session ------------------
-
-    def clear_session(self, doc_id: str):
-        try:
-            self.redis_client.delete(self._get_messages_key(doc_id))
-            self.redis_client.delete(self._get_summary_key(doc_id))
-            self.redis_client.delete(self._get_metadata_key(doc_id))
-        except Exception as e:
-            print(f"[REDIS_DOC] Error clearing session: {e}")
-
+    def clear_session(self, doc_id):
+        self.redis.delete(self._key(doc_id))
+        self.redis.delete(self._summary_key(doc_id))
 
 # ==================== WEAVIATE (DOCUMENT LTM USING doc_id) ====================
 
 class WeaviateMemoryManager:
-    """Long-term document memory manager (patched to prevent socket leaks)."""
+    """Long-term memory for document Q&A + rolling summary."""
 
-    def __init__(self, url: str, api_key: Optional[str] = None):
-        self.client = None
-        self.url = url
-        self.api_key = api_key
+    def __init__(self, url, api_key=None):
+        self.client = weaviate.connect_to_weaviate_cloud(
+            cluster_url=url,
+            auth_credentials=Auth.api_key(api_key)
+        ) if api_key else \
+        weaviate.connect_to_local()
 
-        try:
-            # Cloud connection
-            if api_key:
-                self.client = weaviate.connect_to_weaviate_cloud(
-                    cluster_url=url,
-                    auth_credentials=Auth.api_key(api_key)
-                )
-            else:
-                # Local connection fallback
-                try:
-                    parsed = url.split("://")[-1].split(":")
-                    host = parsed[0]
-                    port = int(parsed[1])
-                except:
-                    host, port = "localhost", 8080
-
-                # Local client requires grpc_port
-                self.client = weaviate.connect_to_local(
-                    host=host,
-                    port=port,
-                    grpc_port=50051,
-                    embedded=False
-                )
-
-            self._setup_schema()
-
-        except Exception as e:
-            print(f"[WEAVIATE] Failed to connect: {e}")
-            self.client = None
+        self._setup_schema()
 
     def _setup_schema(self):
-        """Ensure ConversationMemory schema exists."""
-        if not self.client:
-            return
+        c = self.client.collections
 
-        try:
-            if not self.client.collections.exists("ConversationMemory"):
-                self.client.collections.create(
-                    name="ConversationMemory",
-                    properties=[
-                        Property(name="doc_id", data_type=DataType.TEXT),
-                        Property(name="summary", data_type=DataType.TEXT),
-                        Property(name="key_topics", data_type=DataType.TEXT_ARRAY),
-                        Property(name="timestamp", data_type=DataType.DATE),
-                        Property(name="message_count", data_type=DataType.INT),
-                    ]
-                )
-        except Exception as e:
-            print(f"[WEAVIATE] Schema setup error: {e}")
+        if not c.exists("DocumentQA"):
+            c.create(
+                name="DocumentQA",
+                properties=[
+                    Property(name="doc_id", data_type=DataType.TEXT),
+                    Property(name="user_id", data_type=DataType.TEXT),
+                    Property(name="question", data_type=DataType.TEXT),
+                    Property(name="answer", data_type=DataType.TEXT),
+                    Property(name="sources", data_type=DataType.TEXT),
+                    Property(name="timestamp", data_type=DataType.DATE),
 
-    def store_conversation_summary(
-        self,
-        doc_id: str,
-        summary: str,
-        key_topics: List[str],
-        message_count: int
-    ):
-        """Store summary in Weaviate LTM."""
-        if not self.client:
-            print("[WEAVIATE] No active client. Skipping insert.")
-            return
+                    # NEW
+                    Property(name="summary", data_type=DataType.TEXT),
+                    Property(name="topics", data_type=DataType.TEXT_ARRAY),
+                ]
+            )
 
-        timestamp_string = (
-            datetime.now(timezone.utc)
-            .strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+    def store_qa(self, doc_id, user_id, question, answer, sources):
+        now = datetime.now(timezone.utc).isoformat()
+
+        self.client.collections.get("DocumentQA").data.insert(
+            properties={
+                "doc_id": doc_id,
+                "user_id": user_id,
+                "question": question,
+                "answer": answer,
+                "sources": json.dumps(sources),
+                "timestamp": now,
+            }
         )
 
-        try:
-            self.client.collections.get("ConversationMemory").data.insert(
-                properties={
-                    "doc_id": doc_id,
-                    "summary": summary,
-                    "key_topics": key_topics,
-                    "timestamp": timestamp_string,
-                    "message_count": message_count
-                }
-            )
-        except Exception as e:
-            print(f"[WEAVIATE] Error storing summary: {e}")
+    def store_summary(self, doc_id, summary, topics):
+        now = datetime.now(timezone.utc).isoformat()
 
-    def close(self):
-        """Safely close Weaviate client connection."""
-        try:
-            if self.client:
-                self.client.close()
-        except:
-            pass
-        finally:
-            self.client = None
+        self.client.collections.get("DocumentQA").data.insert(
+            properties={
+                "doc_id": doc_id,
+                "summary": summary,
+                "topics": topics,
+                "timestamp": now
+            }
+        )
+
+    def get_last_qa(self, doc_id, limit=3):
+        res = self.client.query.get(
+            "DocumentQA",
+            ["question", "answer", "timestamp"]
+        ).with_where({
+            "path": ["doc_id"], "operator": "Equal", "valueString": doc_id
+        }).with_sort([
+            {"path": ["timestamp"], "order": "desc"}
+        ]).with_limit(limit).do()
+
+        items = res["data"]["Get"]["DocumentQA"]
+        return [{"question": x["question"], "answer": x["answer"]} for x in items if x.get("question")]
+
+    def get_summary(self, doc_id):
+        res = self.client.query.get(
+            "DocumentQA",
+            ["summary", "timestamp"]
+        ).with_where({
+            "path": ["doc_id"], "operator": "Equal", "valueString": doc_id
+        }).with_sort([
+            {"path": ["timestamp"], "order": "desc"}
+        ]).with_limit(1).do()
+
+        items = res["data"]["Get"]["DocumentQA"]
+        if items and items[0].get("summary"):
+            return items[0]["summary"]
+        return None
 
 
 # ==================== HYBRID MEMORY (DOCUMENT STM + LTM) ====================
-
 class HybridMemoryManager:
     """
-    Combines:
-    Redis (STM)
-    Weaviate (LTM)
+    Unified STM (Redis) + LTM (Weaviate) memory manager.
+    Fully backward-compatible with both old and new constructor signatures.
     """
 
     def __init__(
         self,
         redis_host='localhost',
-        redis_port=6380,
-        weaviate_url='http://localhost:8080',
+        redis_port=6379,
+        weaviate_url=None,
         weaviate_api_key=None,
-        session_ttl_hours=24
+        session_ttl_hours=48,        # <-- added for backward compatibility
+        **kwargs                     # <-- absorbs any unexpected args
     ):
-        self.redis_manager = RedisMemoryManager_document(
-            host=redis_host,
-            port=redis_port,
-            ttl_hours=session_ttl_hours
-        )
-        self.weaviate_manager = WeaviateMemoryManager(
-            url=weaviate_url,
-            api_key=weaviate_api_key
-        )
+        """
+        Accepts both old and new parameters safely.
+        """
+        try:
+            # STM (Redis)
+            self.stm = RedisMemoryManager_document(
+                host=redis_host,
+                port=redis_port,
+                ttl_hours=session_ttl_hours
+            )
 
-    # ------------------ STM ------------------
+            # LTM (Weaviate)
+            if weaviate_url:
+                self.weaviate_manager = WeaviateMemoryManager(
+                    url=weaviate_url,
+                    api_key=weaviate_api_key
+                )
+            else:
+                # If URL missing → don't break startup
+                logger.warning("[HYBRID MEMORY] Weaviate disabled (no URL provided)")
+                self.weaviate_manager = None
+
+            logger.info("[HYBRID MEMORY] Initialized successfully")
+
+        except Exception as e:
+            logger.error(f"[HYBRID MEMORY] Initialization failed: {e}")
+            raise
+
+    # ============================================================
+    # STM (Redis)
+    # ============================================================
 
     def store_message(self, doc_id: str, role: str, content: str):
-        msg = {"role": role, "content": content}
-        self.redis_manager.store_message(doc_id, msg)
+        self.stm.store_message(doc_id, {"role": role, "content": content})
 
-    def get_short_term_memory(self, doc_id: str, limit: int = 10):
-        return self.redis_manager.get_langchain_messages(doc_id, limit)
+    def get_short_term_memory(self, doc_id: str, limit: int = 5):
+        return self.stm.get_messages(doc_id, limit)
 
-    # ------------------ LTM ------------------
+    def get_summary(self, doc_id: str):
+        return self.stm.get_summary(doc_id)
 
-    def archive_conversation(
-        self,
-        doc_id: str,
-        summary: str,
-        key_topics: List[str]
-    ):
-        metadata = self.redis_manager.get_session_metadata(doc_id)
-        message_count = metadata.get("message_count", 0) if metadata else 0
+    def clear(self, doc_id: str):
+        self.stm.clear_session(doc_id)
 
-        self.weaviate_manager.store_conversation_summary(
+    # ============================================================
+    # LTM (Weaviate)
+    # ============================================================
+
+    def store_qa(self, doc_id, user_id, question, answer, sources):
+        if not self.weaviate_manager:
+            return
+        self.weaviate_manager.store_document_qa(
             doc_id=doc_id,
-            summary=summary,
-            key_topics=key_topics,
-            message_count=message_count
+            user_id=user_id,
+            question=question,
+            answer=answer,
+            sources=sources
         )
 
-    def close(self):
-        self.weaviate_manager.close()
+    def store_summary(self, doc_id, summary, topics=["general"]):
+        if not self.weaviate_manager:
+            return
+        self.weaviate_manager.store_summary(
+            doc_id=doc_id,
+            summary=summary,
+            topics=topics
+        )
+
+    def get_last_qa(self, doc_id, limit=3):
+        if not self.weaviate_manager:
+            return []
+        return self.weaviate_manager.get_last_document_qa(doc_id, limit)
+
+    def get_ltm_summary(self, doc_id):
+        if not self.weaviate_manager:
+            return None
+        return self.weaviate_manager.get_document_summary(doc_id)
 

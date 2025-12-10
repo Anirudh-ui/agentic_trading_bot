@@ -33,6 +33,6 @@ venv/
 .venv/
 .env
 service-account.json
-
+*.json
 # Docker volumes usually live outside the project, but exclude any local volume data
 # you might have accidentally created inside the root folder"service-account.json" 

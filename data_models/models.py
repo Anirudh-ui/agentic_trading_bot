@@ -87,5 +87,7 @@ class UserDocumentsResponse(BaseModel):
     documents: List[UserDocument]
     count: int
 
-
+class DocumentSessionCreateRequest(BaseModel):
+    doc_id: str = Field(..., description="Document ID")
+    user_id: Optional[str] = Field("static_test_user", description="User ID")
 

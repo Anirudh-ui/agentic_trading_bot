@@ -432,72 +432,117 @@ Generate a natural, conversational response based on the multimodal analysis pro
     @log_execution_time
     def _groq_response_node(self, state: DocumentState) -> Dict:
         """
-        Node 3: Groq generates conversational response with citations
+        Node 3: Groq generates conversational response with citations.
+        - Uses STM history (Redis)
+        - Uses LTM context (Weaviate)
+        - Stores final Q&A into Weaviate DocumentQA
         """
         try:
             messages = state["messages"]
-            #session_id = state.get("session_id", "default")
             user_id = state.get("user_id", "anonymous")
             doc_id = state.get("doc_id", "")
             gemini_analysis = state.get("gemini_analysis", "No analysis available")
-            
+
             last_message = messages[-1] if messages else None
             if not last_message:
                 return {"messages": [AIMessage(content="No query provided.")]}
-            
+
             query = last_message.content
-            logger.info(f"[GROQ] Generating conversational response...")
-            
-            # Check cache
+            logger.info(f"[GROQ] Generating conversational response…")
+
+            # =====================================================
+            # CACHE CHECK
+            # =====================================================
             cache_key = self.cache_manager._generate_key(
-                doc_id, query, gemini_analysis[:100], prefix="groq_response"
+                doc_id, query, gemini_analysis[:120], prefix="groq_response"
             )
-            cached_response = self.cache_manager.get(cache_key)
-            
-            if cached_response:
+            cached = self.cache_manager.get(cache_key)
+            if cached:
                 logger.info("[GROQ] Using cached response")
-                return {"messages": [cached_response]}
-            
-            # Get conversation history (STM)
+                return {"messages": [cached]}
+
+            # =====================================================
+            # STM HISTORY (Redis) - last 3 messages
+            # =====================================================
             redis_history = self.memory_manager.get_short_term_memory(doc_id, limit=5)
             conversation_history = "\n".join([
-                f"{type(msg).__name__}: {msg.content[:100]}..."
-                for msg in redis_history[-3:]
-            ])
-            
-            # Get long-term context (LTM)
+                f"{type(m).__name__}: {m.content[:150]}…"
+                for m in redis_history[-3:]
+            ]) or "No previous conversation"
+
+            # =====================================================
+            # LTM CONTEXT (Weaviate DocumentQA)
+            # =====================================================
             long_term_context = self._get_document_ltm(doc_id, user_id)
-            
-            # Build Groq prompt
+
+            # =====================================================
+            # Build Groq final prompt
+            # =====================================================
             groq_prompt = self.groq_system_prompt.format(
-                conversation_history=conversation_history or "No previous conversation",
+                conversation_history=conversation_history,
                 long_term_context=long_term_context,
                 gemini_analysis=gemini_analysis,
                 query=query
             )
-            
-            # Invoke Groq
+
+            # =====================================================
+            # CALL GROQ (PRIMARY LLM)
+            # =====================================================
             groq_response = self.groq_llm.invoke([
                 SystemMessage(content=groq_prompt)
             ])
-            
-            # Cache response
-            self.cache_manager.set(cache_key, groq_response)
-            
-            # Store in STM
-            if hasattr(groq_response, 'content'):
-                self.memory_manager.store_message(doc_id, "assistant", groq_response.content)
-            
-            logger.info(f"[GROQ] Response generated | Length: {len(groq_response.content) if hasattr(groq_response, 'content') else 0}")
-            
-            return {"messages": [groq_response]}
-            
-        except Exception as e:
-            logger.error(f"[GROQ] Response generation failed: {e}")
-            error_msg = AIMessage(
-                content="I encountered an error generating the response. Please try again."
+
+            # Extract text cleanly
+            final_text = (
+                groq_response.content
+                if hasattr(groq_response, "content")
+                else str(groq_response)
+            ).strip()
+
+            # Wrap into AIMessage (required by LangGraph)
+            final_message = AIMessage(content=final_text)
+
+            # =====================================================
+            # WRITE TO STM (Redis)
+            # =====================================================
+            self.memory_manager.store_message(
+                doc_id,               # STM key
+                "assistant",          # role
+                final_text            # content
             )
-            return {"messages": [error_msg]}
+
+            # =====================================================
+            # WRITE TO LTM (Weaviate DocumentQA)
+            # =====================================================
+            try:
+                self.memory_manager.weaviate_manager.store_document_qa(
+                    doc_id=doc_id,
+                    user_id=user_id,
+                    question=query,
+                    answer=final_text,
+                    sources=state.get("sources", [])
+                )
+                logger.info(f"[LTM] Q&A stored for doc={doc_id}")
+            except Exception as e:
+                logger.error(f"[LTM ERROR] Failed to store Q&A: {e}")
+
+            # =====================================================
+            # ADD TO CACHE
+            # =====================================================
+            self.cache_manager.set(cache_key, final_message)
+
+            logger.info(f"[GROQ] Response OK | {len(final_text)} chars")
+
+            return {"messages": [final_message]}
+
+        except Exception as e:
+            logger.error(f"[GROQ RESPONSE ERROR] {e}")
+            return {
+                "messages": [
+                    AIMessage(content="I encountered an error generating the response.")
+                ]
+            }
+
     
     def _get_document_ltm(self, doc_id: str, user_id: str) -> str:
         """Retrieve long-term memory for document"""
@@ -525,62 +570,82 @@ Generate a natural, conversational response based on the multimodal analysis pro
     @log_execution_time
     def _summarization_node(self, state: DocumentState) -> Dict:
         """
-        Node 4: Summarize and archive to LTM
+        Node 4: Summarize recent conversation and update LTM (Weaviate).
+        Also updates rolling summary in STM (Redis).
         """
         try:
             messages = state["messages"]
             user_id = state.get("user_id", "anonymous")
             doc_id = state.get("doc_id", "")
-            
+
+            # current summary (from STM)
             current_summary = state.get("summary", "New document conversation")
-            
+
+            # extract only true conversational messages
             conversational_messages = [
-                m for m in messages 
+                m for m in messages
                 if isinstance(m, (HumanMessage, AIMessage))
             ]
-            
-            new_messages = conversational_messages[-5:]
-            
-            if not new_messages:
+
+            # nothing to summarize
+            if not conversational_messages:
                 return state
-            
+
+            # last 5 messages for incremental summarization
+            new_messages = conversational_messages[-5:]
             formatted = "\n".join([
-                f"{type(m).__name__}: {m.content[:150]}"
+                f"{type(m).__name__}: {m.content[:200]}"
                 for m in new_messages
             ])
-            
+
             # ================================
-            # Modern LangChain invocation
+            # Run summarizer LLM
             # ================================
             new_summary_result = self.summary_chain.invoke({
                 "current_summary": current_summary,
                 "new_messages": formatted
             })
 
-            # Result is an AIMessage when using ChatGroq
             if hasattr(new_summary_result, "content"):
                 new_summary = new_summary_result.content.strip()
             else:
-                # fallback for string/dict outputs
                 new_summary = str(new_summary_result).strip()
 
-            logger.info(f"[SUMMARY] Updated for session: {doc_id}")
-            
-            # Archive to LTM if substantial (10+ messages)
-            if len(conversational_messages) >= 10:
-                logger.info(f"[ARCHIVING] Archiving session {doc_id} to LTM")
-                self.memory_manager.archive_conversation(
+            logger.info(f"[SUMMARY] Updated summary for doc={doc_id}")
+
+            # ==========================================================
+            # UPDATE LTM (DocumentQA) → rolling conversation summary
+            # ==========================================================
+            try:
+                self.memory_manager.store_summary(
                     doc_id=doc_id,
                     summary=new_summary,
-                    key_topics=['document', 'analysis', doc_id],
-                    user_preferences={'doc_id': doc_id},
-                    user_id=user_id
+                    topics=["summary", "document", doc_id]
                 )
-            
+                logger.info(f"[LTM] Stored summary for {doc_id}")
+            except Exception as e:
+                logger.error(f"[LTM] Failed to store summary: {e}")
+
+            # ==========================================================
+            # For long sessions (10+ conversational messages), 
+            # We also store a Q&A snapshot to maintain deep history.
+            # ==========================================================
+            if len(conversational_messages) >= 10:
+                logger.info(f"[ARCHIVE] Saving deep summary snapshot for {doc_id}")
+                try:
+                    self.memory_manager.store_summary(
+                        doc_id=doc_id,
+                        summary=new_summary,
+                        topics=["deep", "conversation", doc_id]
+                    )
+                except Exception as e:
+                    logger.error(f"[ARCHIVE] Deep summary store failed: {e}")
+
+            # Return updated summary to workflow state
             return {"summary": new_summary}
-            
+
         except Exception as e:
-            logger.error(f"[SUMMARY] Error: {e}")
+            logger.error(f"[SUMMARY NODE ERROR] {e}")
             return state
 
     
