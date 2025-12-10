@@ -85,43 +85,43 @@ class DocumentSessionManager:
         """Setup Weaviate collections for document management"""
         try:
             client = self.weaviate_manager.client
-            
-            # Collection 1: DocumentMetadata
+            if not client:
+                logger.error("[SCHEMA] Skipped — no Weaviate connection")
+                return
+
+            # ---------------- DocumentMetadata ----------------
             if not client.collections.exists("DocumentMetadata"):
                 client.collections.create(
                     name="DocumentMetadata",
                     properties=[
-                        Property(name="doc_id", data_type=DataType.TEXT, description="Unique document ID"),
-                        Property(name="filename", data_type=DataType.TEXT, description="Original filename"),
-                        Property(name="filename_hash", data_type=DataType.TEXT, description="Hash for duplicate detection"),
-                        Property(name="file_type", data_type=DataType.TEXT, description="File type (pdf, docx, etc)"),
-                        Property(name="upload_timestamp", data_type=DataType.DATE, description="Upload time"),
-                        Property(name="page_count", data_type=DataType.INT, description="Number of pages"),
-                        Property(name="user_id", data_type=DataType.TEXT, description="User ID"),
-                        Property(name="has_tables", data_type=DataType.BOOL, description="Contains tables"),
-                        Property(name="has_charts", data_type=DataType.BOOL, description="Contains charts"),
+                        Property(name="doc_id", data_type=DataType.TEXT),
+                        Property(name="filename", data_type=DataType.TEXT),
+                        Property(name="filename_hash", data_type=DataType.TEXT),
+                        Property(name="file_type", data_type=DataType.TEXT),
+                        Property(name="upload_timestamp", data_type=DataType.DATE),
+                        Property(name="page_count", data_type=DataType.INT),
+                        Property(name="user_id", data_type=DataType.TEXT),
+                        Property(name="has_tables", data_type=DataType.BOOL),
+                        Property(name="has_charts", data_type=DataType.BOOL),
                     ]
                 )
-                logger.info("[SCHEMA] DocumentMetadata collection created")
-            
-            # Collection 2: DocumentQA
+                logger.info("[SCHEMA] DocumentMetadata created")
+
+            # ---------------- DocumentQA ----------------
             if not client.collections.exists("DocumentQA"):
                 client.collections.create(
                     name="DocumentQA",
                     properties=[
-                        Property(name="doc_id", data_type=DataType.TEXT, description="Document ID"),
-                        Property(name="doc_id", data_type=DataType.TEXT, description="Session ID"),
-                        Property(name="user_id", data_type=DataType.TEXT, description="User ID"),
-                        Property(name="question", data_type=DataType.TEXT, description="User question"),
-                        Property(name="answer", data_type=DataType.TEXT, description="Generated answer"),
-                        Property(name="timestamp", data_type=DataType.DATE, description="Q&A timestamp"),
-                        Property(name="sources", data_type=DataType.TEXT, description="Source citations (JSON)"),
+                        Property(name="doc_id", data_type=DataType.TEXT),
+                        Property(name="user_id", data_type=DataType.TEXT),
+                        Property(name="question", data_type=DataType.TEXT),
+                        Property(name="answer", data_type=DataType.TEXT),
+                        Property(name="timestamp", data_type=DataType.DATE),
+                        Property(name="sources", data_type=DataType.TEXT),
                     ]
                 )
-                logger.info("[SCHEMA] DocumentQA collection created")
-            
-            logger.info("[SCHEMA] All collections verified/created")
-            
+                logger.info("[SCHEMA] DocumentQA created")
+
         except Exception as e:
             logger.error(f"[SCHEMA] Setup failed: {e}")
             raise SessionException(
@@ -129,6 +129,8 @@ class DocumentSessionManager:
                 sys,
                 component="schema"
             )
+
+
     
     @log_execution_time
     def register_document(
@@ -483,10 +485,75 @@ class DocumentSessionManager:
         """Close connections"""
         try:
             logger.info("[SESSION MANAGER] Closing connections...")
-            self.weaviate_manager.close()
+            if self.weaviate_manager:
+                self.weaviate_manager.close()
             logger.info("[SESSION MANAGER] Connections closed")
         except Exception as e:
             logger.error(f"[SESSION MANAGER] Error closing: {e}")
+
+    # Inside DocumentSessionManager
+
+def get_last_document_qa(self, doc_id: str, limit: int = 3):
+    """
+    Return last N Q&A pairs for a document from Weaviate.
+    Does NOT modify any existing functionality.
+    """
+    try:
+        result = (
+            self.weaviate_manager.client.query
+            .get("DocumentQA", ["question", "answer", "timestamp"])
+            .with_where({
+                "path": ["doc_id"],
+                "operator": "Equal",
+                "valueString": doc_id
+            })
+            .with_sort([{
+                "path": ["timestamp"],
+                "order": "desc"
+            }])
+            .with_limit(limit)
+            .do()
+        )
+
+        items = result.get("data", {}).get("Get", {}).get("DocumentQA", [])
+        return [
+            {"question": qa["question"], "answer": qa["answer"]}
+            for qa in items
+        ]
+    except Exception as e:
+        print(f"[Weaviate] get_last_document_qa failed: {e}")
+        return []
+
+
+def get_document_qa_count(self, doc_id: str) -> int:
+    """
+    Count total number of Q&A rows for a document in Weaviate.
+    Added safely without affecting existing workflow.
+    """
+    try:
+        result = (
+            self.weaviate_manager.client.query
+            .aggregate("DocumentQA")
+            .with_where({
+                "path": ["doc_id"],
+                "operator": "Equal",
+                "valueString": doc_id
+            })
+            .with_fields("meta { count }")
+            .do()
+        )
+
+        meta = (
+            result.get("data", {})
+                  .get("Aggregate", {})
+                  .get("DocumentQA", [{}])[0]
+                  .get("meta", {})
+        )
+        return meta.get("count", 0)
+
+    except Exception as e:
+        print(f"[Weaviate] get_document_qa_count failed: {e}")
+        return 0
 
 
 # Export

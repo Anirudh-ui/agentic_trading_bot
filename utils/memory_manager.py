@@ -408,28 +408,48 @@ class RedisMemoryManager_document:
 # ==================== WEAVIATE (DOCUMENT LTM USING doc_id) ====================
 
 class WeaviateMemoryManager:
-    """Long-term document memory manager"""
+    """Long-term document memory manager (patched to prevent socket leaks)."""
 
     def __init__(self, url: str, api_key: Optional[str] = None):
-        # Connection logic preserved
-        if api_key:
-            self.client = weaviate.connect_to_weaviate_cloud(
-                cluster_url=url,
-                auth_credentials=Auth.api_key(api_key)
-            )
-        else:
-            try:
-                parts = url.split("://")[-1].split(":")
-                host = parts[0]
-                port = int(parts[1])
-                self.client = weaviate.connect_to_local(host=host, port=port)
-            except:
-                self.client = weaviate.connect_to_local(host="localhost", port=8080)
+        self.client = None
+        self.url = url
+        self.api_key = api_key
 
-        self._setup_schema()
+        try:
+            # Cloud connection
+            if api_key:
+                self.client = weaviate.connect_to_weaviate_cloud(
+                    cluster_url=url,
+                    auth_credentials=Auth.api_key(api_key)
+                )
+            else:
+                # Local connection fallback
+                try:
+                    parsed = url.split("://")[-1].split(":")
+                    host = parsed[0]
+                    port = int(parsed[1])
+                except:
+                    host, port = "localhost", 8080
+
+                # Local client requires grpc_port
+                self.client = weaviate.connect_to_local(
+                    host=host,
+                    port=port,
+                    grpc_port=50051,
+                    embedded=False
+                )
+
+            self._setup_schema()
+
+        except Exception as e:
+            print(f"[WEAVIATE] Failed to connect: {e}")
+            self.client = None
 
     def _setup_schema(self):
-        """Ensure ConversationMemory schema exists"""
+        """Ensure ConversationMemory schema exists."""
+        if not self.client:
+            return
+
         try:
             if not self.client.collections.exists("ConversationMemory"):
                 self.client.collections.create(
@@ -452,13 +472,18 @@ class WeaviateMemoryManager:
         key_topics: List[str],
         message_count: int
     ):
-        """Stores document chat summary in LTM"""
+        """Store summary in Weaviate LTM."""
+        if not self.client:
+            print("[WEAVIATE] No active client. Skipping insert.")
+            return
 
-        timestamp_string = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+        timestamp_string = (
+            datetime.now(timezone.utc)
+            .strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + "Z"
+        )
 
         try:
-            collection = self.client.collections.get("ConversationMemory")
-            collection.data.insert(
+            self.client.collections.get("ConversationMemory").data.insert(
                 properties={
                     "doc_id": doc_id,
                     "summary": summary,
@@ -468,13 +493,17 @@ class WeaviateMemoryManager:
                 }
             )
         except Exception as e:
-            print(f"[WEAVIATE] Error storing LTM summary: {e}")
+            print(f"[WEAVIATE] Error storing summary: {e}")
 
     def close(self):
+        """Safely close Weaviate client connection."""
         try:
-            self.client.close()
+            if self.client:
+                self.client.close()
         except:
             pass
+        finally:
+            self.client = None
 
 
 # ==================== HYBRID MEMORY (DOCUMENT STM + LTM) ====================

@@ -70,8 +70,10 @@ class PostgresManager:
         cur.execute("UPDATE documents SET summary=%s WHERE doc_id=%s", (summary, doc_id))
 
     def delete_document(self, doc_id: str):
-        cur = self.conn.cursor()
-        cur.execute("DELETE FROM documents WHERE doc_id=%s", (doc_id,))
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM documents WHERE doc_id = %s", (doc_id,))
+            self.conn.commit()
+
 
     def get_document_metadata(self, doc_id: str):
         cur = self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor)

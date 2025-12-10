@@ -26,10 +26,10 @@ from exception.exceptions import WorkflowException, VectorStoreException
 from langchain_pinecone import PineconeVectorStore
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from pinecone import Pinecone
-#from langchain.chains import LLMChain
-from langchain_core.prompts import PromptTemplate
-from langchain_community.chains.llm_requests import LLMChain
 
+from langchain_core.prompts import PromptTemplate
+#from langchain_community.chains.llm_requests import LLMChain
+from langchain_core.runnables import RunnableSequence 
 class DocumentState(TypedDict):
     """Enhanced state for two-LLM workflow"""
     messages: Annotated[list, add_messages]
@@ -252,7 +252,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
                 Return ONLY the updated summary.
                 """
             )
-            self.summary_chain = LLMChain(llm=self.groq_llm, prompt=summary_prompt)
+            self.summary_chain = summary_prompt | self.groq_llm#LLMChain(llm=self.groq_llm, prompt=summary_prompt)
             logger.info("[SUMMARY] Chain initialized with Groq")
             
         except Exception as e:
@@ -529,7 +529,6 @@ Generate a natural, conversational response based on the multimodal analysis pro
         """
         try:
             messages = state["messages"]
-            #session_id = state.get("session_id", "default")
             user_id = state.get("user_id", "anonymous")
             doc_id = state.get("doc_id", "")
             
@@ -546,17 +545,25 @@ Generate a natural, conversational response based on the multimodal analysis pro
                 return state
             
             formatted = "\n".join([
-                f"{type(m).__name__}: {m.content[:150]}" 
+                f"{type(m).__name__}: {m.content[:150]}"
                 for m in new_messages
             ])
             
-            # Generate summary
+            # ================================
+            # Modern LangChain invocation
+            # ================================
             new_summary_result = self.summary_chain.invoke({
                 "current_summary": current_summary,
                 "new_messages": formatted
             })
-            
-            new_summary = new_summary_result['text'].strip()
+
+            # Result is an AIMessage when using ChatGroq
+            if hasattr(new_summary_result, "content"):
+                new_summary = new_summary_result.content.strip()
+            else:
+                # fallback for string/dict outputs
+                new_summary = str(new_summary_result).strip()
+
             logger.info(f"[SUMMARY] Updated for session: {doc_id}")
             
             # Archive to LTM if substantial (10+ messages)
@@ -575,6 +582,7 @@ Generate a natural, conversational response based on the multimodal analysis pro
         except Exception as e:
             logger.error(f"[SUMMARY] Error: {e}")
             return state
+
     
     def build(self):
         """Build two-LLM workflow graph"""
@@ -585,14 +593,14 @@ Generate a natural, conversational response based on the multimodal analysis pro
             
             # Add nodes in order
             graph_builder.add_node("retrieval", self._retrieval_node)
-            graph_builder.add_node("gemini_analysis", self._gemini_analysis_node)
+            graph_builder.add_node("gemini_analysis_node", self._gemini_analysis_node)
             graph_builder.add_node("groq_response", self._groq_response_node)
             graph_builder.add_node("summarizer", self._summarization_node)
             
             # Define workflow edges
             graph_builder.add_edge(START, "retrieval")
-            graph_builder.add_edge("retrieval", "gemini_analysis")
-            graph_builder.add_edge("gemini_analysis", "groq_response")
+            graph_builder.add_edge("retrieval", "gemini_analysis_node")
+            graph_builder.add_edge("gemini_analysis_node", "groq_response")
             graph_builder.add_edge("groq_response", "summarizer")
             graph_builder.add_edge("summarizer", END)
             

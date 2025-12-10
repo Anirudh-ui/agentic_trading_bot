@@ -1,12 +1,3 @@
-"""
-Gemini Multimodal Document Processor (FINAL VERSION)
-- Text extraction (PDF/DOCX)
-- OCR text extraction (Gemini)
-- Chart + Diagram extraction (Gemini)
-- Page-level multimodal analysis
-- Store vectors in Pinecone for RAG
-"""
-
 import os
 import json
 import re
@@ -16,102 +7,142 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from PIL import Image
-import pymupdf          # For PDF text extraction
-from pdf2image import convert_from_path
+import pymupdf
 import docx
+from pdf2image import convert_from_path
 
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+# -----------------------------
+# Vertex AI (NEW GEMINI API)
+# -----------------------------
+from vertexai import init
+from vertexai.generative_models import GenerativeModel, Part
+from vertexai.language_models import TextEmbeddingModel
 
+# -----------------------------
+# Pinecone + LangChain wrapper
+# -----------------------------
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.embeddings import Embeddings
 
+# Logger
 from custom_logging.my_logger import logger
 
 
 # ============================================================
-#   GEMINI VISION ANALYZER (Charts, OCR, Diagrams)
+#               INIT VERTEX AI
+# ============================================================
+
+init(
+    project=os.getenv("DOC_AI_PROJECT_ID"),
+    location="us-central1"
+)
+
+
+# ============================================================
+#     LangChain-Compatible Wrapper for Vertex Embeddings
+# ============================================================
+
+class VertexAIEmbeddings(Embeddings):
+    """Adapter to make Vertex `text-embedding-004` compatible with LangChain."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        results = self.model.get_embeddings(texts)
+        return [emb.values for emb in results]
+
+    def embed_query(self, text: str) -> List[float]:
+        result = self.model.get_embeddings([text])[0]
+        return result.values
+
+
+# ============================================================
+#       GEMINI VISION ANALYZER (OCR + Charts + Tables)
 # ============================================================
 
 class GeminiVisionAnalyzer:
-
     def __init__(self):
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-        self.model = genai.GenerativeModel("gemini-1.5-flash")
+        # Fast + cheap vision model
+        self.model = GenerativeModel("gemini-2.5-flash-lite")
 
-        self.safety_settings = {
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        }
+    def _safe_json(self, text: str):
+        """Clean invalid JSON returned by LLM."""
+        try:
+            cleaned = text.strip()
+            cleaned = cleaned.replace("```json", "").replace("```", "")
+            return json.loads(cleaned)
+        except Exception:
+            return {"charts": [], "images": [], "tables": []}
 
+    # -------------------------
+    # OCR + Charts + Images
+    # -------------------------
     def analyze_page(self, image_bytes: bytes, page_num: int) -> Dict[str, Any]:
-        """
-        Vision analysis:
-        - Charts
-        - Diagrams
-        - OCR text inside image
-        """
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        try:
+            img_part = Part.from_data(
+                mime_type="image/png",
+                data=image_bytes
+            )
 
-        prompt = f"""
-You are an expert vision analyzer for documents.
-
-TASKS:
-1. Detect CHARTS (bar, line, pie, scatter, any data visual)
-2. Detect DIAGRAMS / ILLUSTRATIONS
-3. Extract OCR TEXT that appears inside the image
-
-RETURN ONLY JSON in this format:
-
-{{
-  "charts": [
-    {{
-      "chart_id": "C1",
-      "type": "bar/line/pie/other",
-      "description": "What the chart shows",
-      "key_values": "Important numeric values or trends",
-      "page_num": {page_num}
-    }}
-  ],
-  "images": [
-    {{
-      "image_id": "I1",
-      "description": "Description of diagram/image",
-      "text_inside": "OCR extracted text",
-      "page_num": {page_num}
-    }}
-  ]
-}}
-
-Rules:
-- If no charts, return empty list.
-- If no images, return empty list.
-- DO NOT include markdown. DO NOT include commentary.
+            prompt = """
+Return ONLY the following JSON:
+{
+ "charts": [],
+ "images": []
+}
+No explanations.
+No markdown.
 """
 
-        try:
-            response = self.model.generate_content(
-                [prompt, image],
-                safety_settings=self.safety_settings,
-            )
-            raw = response.text.strip()
-            raw = re.sub(r"```.*?```", "", raw, flags=re.DOTALL).strip()
-
-            parsed = json.loads(raw)
+            response = self.model.generate_content([prompt, img_part])
+            return self._safe_json(response.text)
 
         except Exception as e:
-            logger.warning(f"[VISION] JSON failed, fallback used: {e}")
-            parsed = {"charts": [], "images": []}
+            logger.warning(f"[VISION] Failed page analysis: {e}")
+            return {"charts": [], "images": []}
 
-        return parsed
+    # -------------------------
+    # Table Extraction
+    # -------------------------
+    def extract_tables(self, image_bytes: bytes, page_num: int) -> List[Dict]:
+        try:
+            img_part = Part.from_data(
+                mime_type="image/png",
+                data=image_bytes
+            )
+
+            prompt = f"""
+Extract ALL TABLES in this image.
+Return JSON ONLY:
+{{
+ "tables": [
+   {{
+     "table_id": "T{page_num}_1",
+     "page_num": {page_num},
+     "description": "Short description",
+     "rows": [
+        ["Header1", "Header2"]
+     ]
+   }}
+ ]
+}}
+"""
+
+            response = self.model.generate_content([prompt, img_part])
+            parsed = self._safe_json(response.text)
+            return parsed.get("tables", [])
+
+        except Exception:
+            return []
 
 
 # ============================================================
-#   MULTIMODAL DOCUMENT PROCESSOR
+#           MAIN MULTIMODAL PROCESSOR CLASS
 # ============================================================
 
 class GeminiMultimodalProcessor:
@@ -119,44 +150,45 @@ class GeminiMultimodalProcessor:
     def __init__(self):
         logger.info("[INGEST] Initializing Gemini ingestion pipeline...")
 
-        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        # Gemini Vision
         self.vision = GeminiVisionAnalyzer()
 
-        # embeddings
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004"
-        )
+        # Embedding model (Vertex AI)
+        self.embedder = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
-        # pinecone
+        # Pinecone
         self.pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
         self.index = self.pc.Index("trading-bot")
 
     # --------------------------------------------------------
-    # PROCESS DOCUMENT ENTRYPOINT
+    # PROCESS DOCUMENT ENTRY POINT
     # --------------------------------------------------------
     def process_document(self, file_path: str) -> Dict[str, Any]:
 
         ext = Path(file_path).suffix.lower()
+
         if ext == ".pdf":
             return self._process_pdf(file_path)
+
         elif ext == ".docx":
             return self._process_docx(file_path)
+
         else:
             raise Exception(f"Unsupported file type: {ext}")
 
     # --------------------------------------------------------
-    # PDF PROCESSING
+    # PDF Processing
     # --------------------------------------------------------
-    def _process_pdf(self, pdf_path: str) -> Dict[str, Any]:
+    def _process_pdf(self, pdf_path: str):
         logger.info(f"[PDF] Processing {pdf_path}")
 
         pdf = pymupdf.open(pdf_path)
         page_count = len(pdf)
 
-        # Render pages as images (for vision analysis)
         images = convert_from_path(pdf_path, dpi=150)
 
         text_chunks = []
+        all_tables = []
         charts = []
         images_info = []
 
@@ -164,60 +196,70 @@ class GeminiMultimodalProcessor:
 
             logger.info(f"[PDF] Page {page_num}/{page_count}")
 
-            # -------- TEXT EXTRACTION --------
-            text = page.get_text("text")
-            if text.strip():
+            # Image bytes
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            page_bytes = buf.getvalue()
+
+            # --------------------- OCR ----------------------
+            vision_output = self.vision.analyze_page(page_bytes, page_num)
+
+            extracted_text = []
+            for item in vision_output.get("images", []):
+                if "text_inside" in item:
+                    extracted_text.append(item["text_inside"])
+
+            text = "\n".join(extracted_text).strip()
+
+            # Fallback to embedded PDF text
+            if not text:
+                text = page.get_text("text") or ""
+
+            if text:
                 text_chunks.append({
                     "page_num": page_num,
                     "content": text,
                     "type": "text"
                 })
 
-            # -------- VISION ANALYSIS --------
-            img_bytes = BytesIO()
-            img.save(img_bytes, format="PNG")
-            img_bytes = img_bytes.getvalue()
+            # --------------------- Charts + Images ----------------------
+            charts.extend(vision_output.get("charts", []))
+            images_info.extend(vision_output.get("images", []))
 
-            vision_result = self.vision.analyze_page(img_bytes, page_num)
-
-            charts.extend(vision_result.get("charts", []))
-            images_info.extend(vision_result.get("images", []))
+            # --------------------- Table Extraction ----------------------
+            tables = self.vision.extract_tables(page_bytes, page_num)
+            all_tables.extend(tables)
 
         pdf.close()
 
-        logger.info(f"[PDF DONE] Text chunks={len(text_chunks)}, Charts={len(charts)}, Images={len(images_info)}")
+        logger.info(
+            f"[PDF DONE] Text={len(text_chunks)}, "
+            f"Tables={len(all_tables)}, Charts={len(charts)}, Images={len(images_info)}"
+        )
 
         return {
             "text_chunks": text_chunks,
-            "tables": [],     # (We deliberately skip Gemini tables)
+            "tables": all_tables,
             "charts": charts,
             "images": images_info,
             "page_count": page_count,
         }
 
     # --------------------------------------------------------
-    # DOCX PROCESSING
+    # DOCX Processing
     # --------------------------------------------------------
-    def _process_docx(self, docx_path: str) -> Dict[str, Any]:
+    def _process_docx(self, docx_path: str):
         logger.info(f"[DOCX] Processing {docx_path}")
 
         doc = docx.Document(docx_path)
-
-        full_text = []
-        for p in doc.paragraphs:
-            if p.text.strip():
-                full_text.append(p.text)
-
-        text_chunks = [{
-            "page_num": 1,
-            "content": "\n".join(full_text),
-            "type": "text"
-        }]
-
-        logger.info(f"[DOCX DONE] Extracted {len(full_text)} lines")
+        full_text = [p.text for p in doc.paragraphs if p.text.strip()]
 
         return {
-            "text_chunks": text_chunks,
+            "text_chunks": [{
+                "page_num": 1,
+                "content": "\n".join(full_text),
+                "type": "text"
+            }],
             "tables": [],
             "charts": [],
             "images": [],
@@ -225,20 +267,26 @@ class GeminiMultimodalProcessor:
         }
 
     # --------------------------------------------------------
-    # PINECONE STORAGE
+    # STORE IN PINECONE
     # --------------------------------------------------------
     def store_in_pinecone(self, processed: Dict[str, Any], doc_id: str, filename: str):
-        logger.info(f"[PINECONE] Storing vectors for doc {doc_id}")
+
+        logger.info(f"[PINECONE] Storing vectors for {doc_id}")
+
+        # Ensure doc_id is ALWAYS string
+        doc_id = str(doc_id)
+
+        embeddings = VertexAIEmbeddings(self.embedder)
 
         vector_store = PineconeVectorStore(
             index=self.index,
-            embedding=self.embeddings,
+            embedding=embeddings,
             namespace="documents"
         )
 
         docs = []
 
-        # ----- TEXT -----
+        # TEXT
         for chunk in processed["text_chunks"]:
             docs.append(Document(
                 page_content=chunk["content"],
@@ -250,8 +298,31 @@ class GeminiMultimodalProcessor:
                 }
             ))
 
-        # ----- CHARTS -----
-        for chart in processed["charts"]:
+        # TABLES
+        for table in processed.get("tables", []):
+            rows = table.get("rows", [])
+
+            # Normalize rows (prevent NoneType errors)
+            normalized_rows = []
+            for row in rows:
+                normalized_row = [str(cell) if cell is not None else "" for cell in row]
+                normalized_rows.append(normalized_row)
+
+            table_text = "\n".join([" | ".join(r) for r in normalized_rows])
+
+            docs.append(Document(
+                page_content=table_text,
+                metadata={
+                    "doc_id": doc_id,
+                    "filename": filename,
+                    "type": "table",
+                    "page_num": table["page_num"],
+                    "table_id": table["table_id"],
+                    "table_name": table.get("description", "table"),
+                }
+            ))
+        # CHARTS
+        for chart in processed.get("charts", []):
             desc = f"{chart.get('description','')}\nKey Values: {chart.get('key_values','')}"
             docs.append(Document(
                 page_content=desc,
@@ -259,14 +330,13 @@ class GeminiMultimodalProcessor:
                     "doc_id": doc_id,
                     "filename": filename,
                     "type": "chart",
-                    "page_num": chart["page_num"],
-                    "chart_id": chart["chart_id"],
-                    "chart_name": chart.get("type", "chart")
+                    "page_num": chart.get("page_num", 1),
+                    "chart_id": chart.get("chart_id", "")
                 }
             ))
 
-        # ----- IMAGES / DIAGRAMS -----
-        for img in processed["images"]:
+        # IMAGES
+        for img in processed.get("images", []):
             desc = f"{img.get('description','')}\nOCR: {img.get('text_inside','')}"
             docs.append(Document(
                 page_content=desc,
@@ -274,19 +344,18 @@ class GeminiMultimodalProcessor:
                     "doc_id": doc_id,
                     "filename": filename,
                     "type": "image",
-                    "page_num": img["page_num"],
-                    "image_id": img["image_id"]
+                    "page_num": img.get("page_num", 1),
+                    "image_id": img.get("image_id", "")
                 }
             ))
 
-        # Generate IDs
-        ids = [str(uuid4()) for _ in docs]
-
-        # Upload
-        vector_store.add_documents(documents=docs, ids=ids)
+        vector_store.add_documents(
+            documents=docs,
+            ids=[str(uuid4()) for _ in docs]
+        )
 
         logger.info(f"[PINECONE DONE] Stored {len(docs)} vectors.")
 
 
-# EXPORT
+
 __all__ = ["GeminiMultimodalProcessor"]

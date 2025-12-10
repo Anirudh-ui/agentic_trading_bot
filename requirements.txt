@@ -8,7 +8,7 @@ langchain-text-splitters==0.3.9
 langchain-google-genai
 langchain-groq==0.3.7
 langchain-pinecone==0.2.3
-langchain-tavily
+#langchain-tavily
 ##############################
 # PDF / DOC PROCESSING
 ##############################
@@ -83,3 +83,8 @@ streamlit==1.30.0
 # DATABASES
 ##############################
 psycopg2-binary
+
+
+python-multipart
+google-cloud-documentai
+google-cloud-storage

@@ -27,6 +27,7 @@ from custom_logging.my_logger import logger, log_execution_time
 from langchain_core.messages import HumanMessage , AIMessage
 from utils.postgres_manager import PostgresManager
 from data_models.models import * 
+from pinecone import Pinecone
 # Initialize FastAPI app
 app = FastAPI(
     title="Trading Bot - Multimodal RAG API",
@@ -144,6 +145,7 @@ async def root():
         ],
         "endpoints": {
             "/upload-document": "POST - Upload document with Gemini processing",
+            "/delete-document/{doc_id}": "DELETE - Delete document and associated data",
             "/document-query": "POST - Query document (Gemini analysis + Groq response)",
             "/internet-query": "POST - Internet search (intent routing + tools)",
             "/get-user-documents": "GET - Get all user documents",
@@ -191,17 +193,22 @@ async def upload_document(file: UploadFile = File(...)):
         if existing:
             logger.info(f"[UPLOAD] Duplicate found → {existing['doc_id']}")
 
-            return DocumentUploadResponse(
-                doc_id=str(existing["doc_id"]),
-                name=existing["filename"],
-                uploadedAt=existing["uploaded_at"].isoformat(),
-                size=f"{existing['size_bytes']/1024:.1f} KB",
-                page_count=existing["page_count"],
-                is_first_time=False,
-                previous_summary=existing.get("summary"),
-                has_tables=existing["has_tables"],
-                has_charts=existing["has_charts"],
-            )
+            doc_id = existing["doc_id"]
+
+            return {
+                "doc_id": str(doc_id),
+                "name": existing["filename"],
+                "uploadedAt": existing["uploaded_at"].isoformat(),
+                "size": f"{existing['size_bytes']/1024:.1f} KB",
+                "page_count": existing["page_count"],
+                "has_tables": existing["has_tables"],
+                "has_charts": existing["has_charts"],
+                "duplicate": True,
+                "is_first_time": False,
+                "previous_summary": doc_session_manager.get_document_summary(doc_id),
+                "last_3_chats": doc_session_manager.get_last_document_qa(doc_id, limit=3),
+                "qa_count": doc_session_manager.get_document_qa_count(doc_id)
+            }
 
         # ---------------------------------------------------
         # 4) Save temporary file for Gemini
@@ -244,7 +251,7 @@ async def upload_document(file: UploadFile = File(...)):
         # 7) Store chunks in Pinecone
         # ---------------------------------------------------
         gemini_processor.store_in_pinecone(
-            processed_data=processed,
+            processed=processed,
             doc_id=doc_id,
             filename=file.filename,
         )
@@ -277,6 +284,85 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"[UPLOAD] Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+@app.delete("/delete-document/{doc_id}")
+async def delete_document(doc_id: str):
+    """
+    Delete a document completely:
+    - Remove all Pinecone vectors for this doc
+    - Remove document record from Postgres
+    - Clear STM/LTM memory for this doc
+    """
+    try:
+        logger.info(f"[DELETE] Request received for doc: {doc_id}")
+
+        # ---------------------------------------------------------
+        # 0) Validate document exists in Postgres
+        # ---------------------------------------------------------
+        metadata = postgres_manager.get_document_metadata(doc_id)
+        if not metadata:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # ---------------------------------------------------------
+        # 1) Delete from Pinecone (FAST, FILTER-BASED)
+        # ---------------------------------------------------------
+        try:
+            pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
+            index = pc.Index("trading-bot")
+
+            index.delete(
+                filter={"doc_id": doc_id},
+                namespace="documents"
+            )
+
+            logger.info(f"[DELETE] Pinecone vectors removed for {doc_id}")
+
+        except Exception as e:
+            logger.error(f"[DELETE] Pinecone delete failed: {e}")
+            # Continue pipeline – do NOT fail entire delete
+
+        # ---------------------------------------------------------
+        # 2) Delete from Postgres
+        # ---------------------------------------------------------
+        try:
+            postgres_manager.delete_document(doc_id)
+            logger.info("[DELETE] Postgres record removed")
+
+        except Exception as e:
+            logger.error(f"[DELETE] Postgres delete failed: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to delete Postgres record"
+            )
+
+        # ---------------------------------------------------------
+        # 3) Clear STM + LTM memory
+        # ---------------------------------------------------------
+        try:
+            # Redis STM (inside document workflow)
+            document_workflow.memory_manager.delete_conversation(doc_id)
+
+            # Weaviate LTM (Q&A + summary)
+            doc_session_manager.delete_document_history(doc_id)
+
+            logger.info("[DELETE] Memory (STM + LTM) cleared")
+
+        except Exception as e:
+            logger.warning(f"[DELETE] Memory cleanup failed: {e}")
+
+        # ---------------------------------------------------------
+        # 4) Final Response
+        # ---------------------------------------------------------
+        return {
+            "status": "success",
+            "message": f"Document {doc_id} deleted successfully",
+            "doc_id": doc_id,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"[DELETE] Unexpected error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/document-query", response_model=QueryResponse)
@@ -369,6 +455,46 @@ async def document_query(request: DocumentQueryRequest):
     except Exception as e:
         logger.error(f"[DOC QUERY] Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Query failed: {str(e)}")
+@app.get("/get-document-chat-preview/{doc_id}")
+async def get_document_chat_preview(doc_id: str):
+    """
+    Fetch summary + last 3 chats + QA count for a document.
+    Uses:
+    - Postgres for metadata
+    - Weaviate for Q&A
+    """
+    try:
+        logger.info(f"[PREVIEW] Getting chat preview for doc: {doc_id}")
+
+        # Validate doc exists in Postgres
+        metadata = postgres_manager.get_document_metadata(doc_id)
+        if not metadata:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # From Weaviate (LTM)
+        summary = doc_session_manager.get_document_summary(doc_id)
+        last_3 = doc_session_manager.get_last_document_qa(doc_id, limit=3)
+        qa_count = doc_session_manager.get_document_qa_count(doc_id)
+
+        return {
+            "doc_id": doc_id,
+            "summary": summary or "No previous conversations",
+            "last_3_chats": last_3,
+            "qa_count": qa_count,
+            "has_history": qa_count > 0,
+            "metadata": {
+                "name": metadata["filename"],
+                "uploadedAt": metadata["uploaded_at"].isoformat(),
+                "size": f"{metadata['size_bytes']/1024:.1f} KB",
+                "page_count": metadata["page_count"],
+                "has_tables": metadata["has_tables"],
+                "has_charts": metadata["has_charts"]
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"[PREVIEW] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/internet-query", response_model=QueryResponse)
