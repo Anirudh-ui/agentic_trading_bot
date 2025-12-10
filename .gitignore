@@ -32,5 +32,7 @@ __pycache__/
 venv/
 .venv/
 .env
+.service-account.json
+
 # Docker volumes usually live outside the project, but exclude any local volume data
 # you might have accidentally created inside the root folder
