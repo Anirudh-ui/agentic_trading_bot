@@ -91,3 +91,35 @@ class DocumentSessionCreateRequest(BaseModel):
     doc_id: str = Field(..., description="Document ID")
     user_id: Optional[str] = Field("static_test_user", description="User ID")
 
+class DocumentHistoryQA(BaseModel):
+    question: str = Field(..., description="User question")
+    answer: str = Field(..., description="Assistant answer")
+
+
+class DocumentHistoryResponse(BaseModel):
+    doc_id: str = Field(..., description="Document ID")
+    filename: str = Field(..., description="Filename of the document")
+    first_time: bool = Field(..., description="Whether this is the first time chatting with the document")
+    summary: Optional[str] = Field(None, description="Rolling summary of the document conversation")
+    qa_count: int = Field(..., description="Total number of Q&A interactions")
+    last_qa: List[DocumentHistoryQA] = Field(..., description="Last 3 Q&A messages")
+class DocumentPreviewQA(BaseModel):
+    question: str = Field(..., description="The user's question")
+    answer: str = Field(..., description="The assistant's answer")
+
+
+class DocumentChatPreviewResponse(BaseModel):
+    doc_id: str = Field(..., description="Document ID")
+    filename: str = Field(..., description="Document filename")
+    uploadedAt: str = Field(..., description="Upload timestamp")
+    summary: Optional[str] = Field(None, description="Conversation summary snippet")
+    last_qa: List[DocumentPreviewQA] = Field([], description="Last 3 Q&A interactions")
+    page_count: int = Field(..., description="Number of pages")
+    has_tables: bool = Field(..., description="Whether document contains tables")
+    has_charts: bool = Field(..., description="Whether document contains charts")
+
+class DocumentSessionResetResponse(BaseModel):
+    session_id: str = Field(..., description="Session ID for STM namespace")
+    doc_id: str = Field(..., description="Document ID")
+    summary: Optional[str] = Field(None, description="Rolling summary after reset")
+    message: str = Field(..., description="Confirmation message")

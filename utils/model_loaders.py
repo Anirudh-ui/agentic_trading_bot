@@ -5,7 +5,25 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 #from langchain_google_genai import ChatGoogleGenerativeAI
 from utils.config_loader import load_config
 from langchain_groq import ChatGroq
+from vertexai.language_models import TextEmbeddingModel
+from typing import Dict, Any, List 
+from langchain_core.embeddings import Embeddings
 
+class VertexAIEmbeddings_for_workflow(Embeddings):
+    """Adapter to make Vertex `text-embedding-004` compatible with LangChain."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        if not texts:
+            return []
+        results = self.model.get_embeddings(texts)
+        return [emb.values for emb in results]
+
+    def embed_query(self, text: str) -> List[float]:
+        result = self.model.get_embeddings([text])[0]
+        return result.values
 class ModelLoader:
     """
     A utility class to load embedding models and LLM models.
@@ -45,3 +63,17 @@ class ModelLoader:
         
         
         return groq_model  # Placeholder for future LLM loading
+    
+
+
+    def load_embeddings_vertex(self):
+        """
+        Load and return the Vertex AI embedding model (text-embedding-004).
+        """
+        print("Loading Embedding model (Vertex text-embedding-004)")
+        
+        # Load the raw Vertex AI model
+        base_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+        
+        # Wrap it so LangChain can use it
+        return VertexAIEmbeddings_for_workflow(base_model)

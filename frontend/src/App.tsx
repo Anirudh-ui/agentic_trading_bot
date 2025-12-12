@@ -46,12 +46,10 @@ export default function App() {
   const [isGenLoading, setIsGenLoading] = useState(false);
   const [documentSummary, setDocumentSummary] = useState<string>('');
   const [uploadProgress, setUploadProgress] = useState<string>('');
-  
-  // Session IDs
+
   const [documentSessionId, setDocumentSessionId] = useState<string>('');
   const [generalSessionId] = useState(`trade_app_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
 
-  // Load existing documents on mount
   useEffect(() => {
     loadUserDocuments();
   }, []);
@@ -75,43 +73,40 @@ export default function App() {
       console.error('[LOAD DOCS] Error:', error);
     }
   };
-  // Create backend session for a document
-const createSessionForDocument = async (docId: string) => {
-  try {
-    const resp = await fetch(`${API_BASE_URL}/document-session/create`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ doc_id: docId })
-    });
 
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || "Failed to create session");
+  const createSessionForDocument = async (docId: string) => {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/document-session/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ doc_id: docId })
+      });
 
-    return data.session_id;
-  } catch (err) {
-    console.error("[SESSION CREATE] Error:", err);
-    return null;
-  }
-};
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || "Failed to create session");
+
+      return data.session_id;
+    } catch (err) {
+      console.error("[SESSION CREATE] Error:", err);
+      return null;
+    }
+  };
 
   const handleDocumentUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
 
     setIsUploading(true);
     setUploadProgress('Uploading document...');
-    
+
     try {
       const file = files[0];
-      
-      // Validate file size (max 50MB)
       const maxSize = 50 * 1024 * 1024;
       if (file.size > maxSize) {
         alert('File size exceeds 50MB limit');
         setIsUploading(false);
         return;
       }
-      
-      // Validate file type
+
       const allowedTypes = ['.pdf', '.docx', '.doc'];
       const fileExt = '.' + file.name.split('.').pop()?.toLowerCase();
       if (!allowedTypes.includes(fileExt)) {
@@ -119,24 +114,23 @@ const createSessionForDocument = async (docId: string) => {
         setIsUploading(false);
         return;
       }
-      
+
       const formData = new FormData();
       formData.append('file', file);
-
       setUploadProgress('Processing with Gemini...');
-      
+
       const response = await fetch(`${API_BASE_URL}/upload-document`, {
         method: 'POST',
         body: formData,
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Upload failed');
+        const e = await response.json();
+        throw new Error(e.detail || "Upload failed");
       }
 
       const uploadedDoc = await response.json();
-      
+
       const newDocument: Document = {
         id: uploadedDoc.doc_id,
         name: uploadedDoc.name,
@@ -149,34 +143,29 @@ const createSessionForDocument = async (docId: string) => {
         has_charts: uploadedDoc.has_charts
       };
 
-      // Check if document already exists in list
-      const existingIndex = documents.findIndex(d => d.id === newDocument.id);
-      if (existingIndex === -1) {
-        setDocuments(prev => [...prev, newDocument]);
-      }
-      
-      // Auto-select
+      const exists = documents.find(d => d.id === newDocument.id);
+      if (!exists) setDocuments(prev => [...prev, newDocument]);
+
       setSelectedDocument(newDocument);
       setDocumentMessages([]);
-      const newSession = await createSessionForDocument(newDocument.id);
-      setDocumentSessionId(newSession); // Session ID = doc_id
-      
-      // Show document info
+
+      const session = await createSessionForDocument(newDocument.id);
+      setDocumentSessionId(session);
+
       if (uploadedDoc.is_first_time) {
         const features = [];
         if (uploadedDoc.has_tables) features.push('tables');
         if (uploadedDoc.has_charts) features.push('charts');
-        const featureText = features.length > 0 ? ` Contains: ${features.join(', ')}.` : '';
-        setDocumentSummary(`Document uploaded successfully (${uploadedDoc.page_count} pages).${featureText} Ready to answer questions!`);
+        const f = features.length ? ` Contains: ${features.join(', ')}.` : '';
+        setDocumentSummary(`Document uploaded successfully (${uploadedDoc.page_count} pages).${f}`);
       } else {
-        setDocumentSummary(uploadedDoc.previous_summary || 'Resuming previous conversation with this document.');
+        setDocumentSummary(uploadedDoc.previous_summary || "Resuming previous conversation.");
       }
-      
-      console.log('[UPLOAD] Success:', newDocument);
+
       setUploadProgress('');
-    } catch (error) {
-      console.error('[UPLOAD] Error:', error);
-      alert(error instanceof Error ? error.message : 'Upload failed. Please try again.');
+    } catch (err: any) {
+      console.error("[UPLOAD] Error:", err);
+      alert(err.message || "Upload error");
       setUploadProgress('');
     } finally {
       setIsUploading(false);
@@ -184,222 +173,220 @@ const createSessionForDocument = async (docId: string) => {
   };
 
   const handleDocumentSelect = async (doc: Document | null) => {
-  if (isDocLoading) return;
+    if (isDocLoading) return;
 
-  if (!doc) {
-    setSelectedDocument(null);
+    if (!doc) {
+      setSelectedDocument(null);
+      setDocumentMessages([]);
+      setDocumentSummary('');
+      setDocumentSessionId('');
+      return;
+    }
+
+    setSelectedDocument(doc);
     setDocumentMessages([]);
-    setDocumentSummary('');
-    setDocumentSessionId('');
-    return;
-  }
 
-  setSelectedDocument(doc);
-  setDocumentMessages([]);
+    const sessionId = await createSessionForDocument(doc.id);
+    setDocumentSessionId(sessionId);
 
-  console.log("[SELECT] Document:", doc.id);
+    const resp = await fetch(`${API_BASE_URL}/document-history/${doc.id}`);
+    const data = await resp.json();
 
-  // 1️⃣ Create session for this doc
-  const sessionId = await createSessionForDocument(doc.id);
-  setDocumentSessionId(sessionId);
+    if (!data.has_history) {
+      setDocumentSummary("You are interacting with this document for the first time.");
+      return;
+    }
 
-  // 2️⃣ Load doc history: summary + has_history
-  const resp = await fetch(`${API_BASE_URL}/document-history/${doc.id}`);
-  const data = await resp.json();
+    setDocumentSummary(data.summary || "Previous summary available");
+  };
 
-  if (!data.has_history) {
-    setDocumentSummary("You are interacting with this document for the first time.");
-    return;
-  }
-
-  setDocumentSummary(data.summary || "Previous summary available");
-};
-
-
+  // -----------------------------------------------------
+  // 🔥🔥🔥 FIXED RAG BUG — FAST PATH HANDLING ADDED HERE
+  // -----------------------------------------------------
   const handleSendDocumentMessage = async (text: string) => {
     if (!selectedDocument || isDocLoading) return;
 
-    const userMessage: Message = {
+    const userMsg: Message = {
       id: `user_${Date.now()}`,
       text,
-      sender: 'user',
-      timestamp: new Date(),
+      sender: "user",
+      timestamp: new Date()
     };
 
-    setDocumentMessages(prev => [...prev, userMessage]);
+    setDocumentMessages(prev => [...prev, userMsg]);
     setIsDocLoading(true);
 
     try {
-      console.log('[DOC QUERY] Sending:', text.substring(0, 50));
-      // ✅ SESSION ID SAFETY CHECK — PLACE IT HERE
-    if (!documentSessionId) {
-      console.error("No session ID for document.");
+      if (!documentSessionId) {
+        setDocumentMessages(prev => [
+          ...prev,
+          {
+            id: `error_${Date.now()}`,
+            text: "No document session found. Re-select the document.",
+            sender: "bot",
+            timestamp: new Date()
+          }
+        ]);
+        setIsDocLoading(false);
+        return;
+      }
+
+      // ----------------------------
+      // CALL BACKEND
+      // ----------------------------
+      const resp = await fetch(`${API_BASE_URL}/document-query`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: text,
+          session_id: documentSessionId,
+          doc_id: selectedDocument.id
+        })
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "Query failed");
+
+      // -------------------------------------------------------
+      // 🔥🔥🔥 FAST PATH — GREETING, NOT_RELATED, SUMMARY, HISTORY
+      // -------------------------------------------------------
+      if (data.is_fast_path === true) {
+        const botMessage: Message = {
+          id: data.message_id,
+          text: data.answer,
+          sender: "bot",
+          timestamp: new Date(data.timestamp),
+          sources: [],             // 🔥 NO SOURCES FOR FAST-PATH
+          query_type: data.query_type,
+          is_fast_path: true
+        };
+
+        setDocumentMessages(prev => [...prev, botMessage]);
+
+        if (data.doc_summary) setDocumentSummary(data.doc_summary);
+
+        console.log("[FAST-PATH] handled:", data.query_type);
+
+        setIsDocLoading(false);
+        return;  // 🔥 IMPORTANT
+      }
+
+      // -------------------------------------------------------
+      // 🔵 NORMAL RAG FLOW (DOCUMENT_QUERY)
+      // -------------------------------------------------------
+      const botMessage: Message = {
+        id: data.message_id,
+        text: data.answer,
+        sender: "bot",
+        timestamp: new Date(data.timestamp),
+        sources: data.sources || [],
+        query_type: data.query_type,
+        is_fast_path: false
+      };
+
+      setDocumentMessages(prev => [...prev, botMessage]);
+
+      if (data.doc_summary) setDocumentSummary(data.doc_summary);
+
+    } catch (err: any) {
       setDocumentMessages(prev => [
         ...prev,
         {
           id: `error_${Date.now()}`,
-          text: "No session available. Try re-selecting the document.",
-          sender: 'bot',
-          timestamp: new Date(),
+          text: err.message || "Something went wrong. Try again.",
+          sender: "bot",
+          timestamp: new Date()
         }
       ]);
-      setIsDocLoading(false);
-      return;
-    }
-      const response = await fetch(`${API_BASE_URL}/document-query`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question: text,
-          session_id: documentSessionId,
-          doc_id: selectedDocument.id,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Query failed');
-      }
-
-      const data = await response.json();
-
-      const botMessage: Message = {
-        id: data.message_id,
-        text: data.answer,
-        sender: 'bot',
-        timestamp: new Date(data.timestamp),
-        sources: data.sources || [],
-        query_type: data.query_type
-      };
-
-      setDocumentMessages(prev => [...prev, botMessage]);
-      
-      // Update summary
-      if (data.doc_summary) {
-        setDocumentSummary(data.doc_summary);
-      }
-      
-      console.log('[DOC QUERY] Success, sources:', data.sources?.length || 0);
-      
-    } catch (error) {
-      console.error('[DOC QUERY] Error:', error);
-      
-      const errorMessage: Message = {
-        id: `error_${Date.now()}`,
-        text: error instanceof Error ? error.message : 'Sorry, I encountered an error. Please try again.',
-        sender: 'bot',
-        timestamp: new Date(),
-      };
-      
-      setDocumentMessages(prev => [...prev, errorMessage]);
     } finally {
       setIsDocLoading(false);
     }
   };
 
+  // -----------------------------------------------------
+  // GENERAL CHAT HANDLER (unchanged)
+  // -----------------------------------------------------
   const handleSendGeneralMessage = async (text: string) => {
     if (isGenLoading) return;
     
-    const userMessage: Message = {
+    const userMsg: Message = {
       id: `user_${Date.now()}`,
       text,
-      sender: 'user',
-      timestamp: new Date(),
+      sender: "user",
+      timestamp: new Date()
     };
 
-    setGeneralMessages(prev => [...prev, userMessage]);
+    setGeneralMessages(prev => [...prev, userMsg]);
     setIsGenLoading(true);
 
     try {
-      console.log('[GENERAL QUERY] Sending:', text.substring(0, 50));
-      
-      const response = await fetch(`${API_BASE_URL}/internet-query`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const resp = await fetch(`${API_BASE_URL}/internet-query`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           question: text,
-          session_id: generalSessionId,
-        }),
+          session_id: generalSessionId
+        })
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || 'Query failed');
-      }
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || "Query failed");
 
-      const data = await response.json();
-
-      const botMessage: Message = {
+      const botMsg: Message = {
         id: data.message_id,
         text: data.answer,
-        sender: 'bot',
+        sender: "bot",
         timestamp: new Date(data.timestamp),
         sources: data.sources || [],
-        query_type: data.query_type,
         is_fast_path: data.is_fast_path
       };
 
-      setGeneralMessages(prev => [...prev, botMessage]);
-      
-      console.log('[GENERAL QUERY] Success, type:', data.query_type, 'fast-path:', data.is_fast_path);
-      
-    } catch (error) {
-      console.error('[GENERAL QUERY] Error:', error);
-      
-      const errorMessage: Message = {
-        id: `error_${Date.now()}`,
-        text: error instanceof Error ? error.message : 'Sorry, I encountered an error. Please try again.',
-        sender: 'bot',
-        timestamp: new Date(),
-      };
-      
-      setGeneralMessages(prev => [...prev, errorMessage]);
+      setGeneralMessages(prev => [...prev, botMsg]);
+
+    } catch (err: any) {
+      setGeneralMessages(prev => [
+        ...prev,
+        {
+          id: `error_${Date.now()}`,
+          text: err.message || "Error occurred.",
+          sender: "bot",
+          timestamp: new Date()
+        }
+      ]);
     } finally {
       setIsGenLoading(false);
     }
   };
+
   const handleDeleteDocument = async (docId: string) => {
-    const confirmDelete = window.confirm("Are you sure you want to delete this document?");
-    if (!confirmDelete) return;
+    if (!confirm("Delete document permanently?")) return;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/delete-document/${docId}`, {
-        method: "DELETE",
+      await fetch(`${API_BASE_URL}/delete-document/${docId}`, {
+        method: "DELETE"
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to delete document");
-      }
-
-      // Remove from UI
       setDocuments(prev => prev.filter(d => d.id !== docId));
 
-      // Reset UI if deleted doc was selected
       if (selectedDocument?.id === docId) {
         setSelectedDocument(null);
         setDocumentMessages([]);
         setDocumentSummary('');
       }
-
-    } catch (error) {
-      console.error("DELETE ERROR:", error);
-      alert("Failed to delete. Try again.");
+    } catch (err) {
+      alert("Delete failed.");
     }
   };
- 
+
   const handleCloseGeneralChat = async () => {
     setIsClosing(true);
-    
-    // Clear session in backend
+
     try {
-      console.log('[CLEAR SESSION] Clearing:', generalSessionId);
       await fetch(`${API_BASE_URL}/clear-internet-session?session_id=${generalSessionId}`, {
-        method: 'POST'
+        method: "POST"
       });
-    } catch (error) {
-      console.error('[CLEAR SESSION] Error:', error);
-    }
-    
+    } catch {}
+
     setTimeout(() => {
       setIsGeneralChatOpen(false);
       setGeneralMessages([]);
@@ -409,14 +396,15 @@ const createSessionForDocument = async (docId: string) => {
 
   return (
     <div className="flex h-screen bg-gray-50 relative overflow-hidden">
+
       {isGeneralChatOpen && (
         <div 
-          className="fixed inset-0 bg-black bg-opacity-40 z-30 transition-opacity duration-300" 
+          className="fixed inset-0 bg-black bg-opacity-40 z-30"
           onClick={handleCloseGeneralChat}
         />
       )}
 
-      {/* Left Panel - Documents (30%) */}
+      {/* Sidebar */}
       <div className="w-[30%] relative z-40">
         <DocumentSidebar
           documents={documents}
@@ -429,7 +417,7 @@ const createSessionForDocument = async (docId: string) => {
         />
       </div>
 
-      {/* Middle Panel - Document Chat (70% or adjusted) */}
+      {/* Document Chat */}
       <div className="flex-1 relative z-40">
         <DocumentChat
           selectedDocument={selectedDocument}
@@ -442,10 +430,10 @@ const createSessionForDocument = async (docId: string) => {
         />
       </div>
 
-      {/* General Chat Panel */}
+      {/* General Chat */}
       {(isGeneralChatOpen || isClosing) && (
-        <div 
-          className={`relative z-40 ${isClosing ? 'animate-collapse' : 'animate-expand'}`} 
+        <div
+          className={`relative z-40 ${isClosing ? 'animate-collapse' : 'animate-expand'}`}
           style={{ width: '320px' }}
         >
           <GeneralChatPanel
@@ -458,6 +446,7 @@ const createSessionForDocument = async (docId: string) => {
           />
         </div>
       )}
+
     </div>
   );
 }

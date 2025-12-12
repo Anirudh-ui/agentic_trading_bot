@@ -1,715 +1,564 @@
 """
-Document RAG Workflow - Two-LLM Architecture
-- Gemini Flash: Multimodal document analysis (tables, charts, text)
-- Groq: Fast conversational response generation with source citation
-- Enhanced logging and exception handling
-- STM + LTM session management
+DOCUMENT RAG WORKFLOW (Final Stable Version)
+--------------------------------------------
+Two-LLM Architecture:
+ - Gemini 2.5 Flash Lite → Deep chunk understanding
+ - Groq Qwen-32B → Final answer with citations
+ - Pinecone → Vector search
+ - HybridMemoryManager → STM (Redis) + LTM (Weaviate)
+
+This version:
+ - Uses Redis summary first, then Weaviate summary
+ - Clean separation of STM/LTM (no .ltm usage)
+ - Full intent routing integrated
+ - Correct summarizer node
+ - Proper citation formatting
 """
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from typing_extensions import Annotated, TypedDict
-from typing import List, Dict, Optional
 import os
 import sys
+from typing import Dict, List
 from datetime import datetime
 
-# Internal imports
+from typing_extensions import TypedDict, Annotated
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+
+from langchain_core.messages import (
+    HumanMessage,
+    AIMessage,
+    SystemMessage
+)
+
+from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
+from vertexai.generative_models import GenerativeModel
+
 from utils.model_loaders import ModelLoader
 from utils.memory_manager import HybridMemoryManager
 from utils.cache_manager import get_cache_manager
+
 from custom_logging.my_logger import logger, log_execution_time
 from exception.exceptions import WorkflowException, VectorStoreException
+from utils.document_intent_classifier import DocumentIntentClassifier
 
-# LangChain imports
-from langchain_pinecone import PineconeVectorStore
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from pinecone import Pinecone
+# ================================================================
+# WORKFLOW STATE
+# ================================================================
 
-from langchain_core.prompts import PromptTemplate
-#from langchain_community.chains.llm_requests import LLMChain
-from langchain_core.runnables import RunnableSequence 
 class DocumentState(TypedDict):
-    """Enhanced state for two-LLM workflow"""
     messages: Annotated[list, add_messages]
     doc_id: str
-    #session_id: str
     user_id: str
-    retrieved_chunks: list
-    sources: list
-    gemini_analysis: str  # NEW: Gemini's multimodal analysis
+    retrieved_chunks: List[Dict]
+    sources: List[Dict]
+    gemini_analysis: str
     summary: str
 
 
+# ================================================================
+# DOCUMENT WORKFLOW BUILDER
+# ================================================================
+
 class DocumentRAGWorkflowBuilder:
-    """
-    Two-LLM Document RAG Workflow:
-    1. Retrieve relevant chunks from Pinecone
-    2. Gemini Flash analyzes multimodal content (text/tables/charts)
-    3. Groq generates conversational response with citations
-    4. STM/LTM session management
-    """
-    
+
     def __init__(self):
-        """Initialize two-LLM workflow"""
         try:
-            logger.info("[DOCUMENT WORKFLOW] Initializing Two-LLM architecture...")
-            
-            # Model loader
+            logger.info("[WORKFLOW] Initializing Document Workflow...")
+
+            # ---------------------
+            # Load LLMs
+            # ---------------------
+            self.gemini_llm = GenerativeModel("gemini-2.5-flash-lite")
             self.model_loader = ModelLoader()
-            
-            # LLM 1: Gemini Flash for multimodal analysis
-            self.gemini_llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
-                google_api_key=os.getenv('GOOGLE_API_KEY'),
-                temperature=0.1
-            )
-            logger.info("[DOCUMENT WORKFLOW] Gemini Flash loaded for multimodal analysis")
-            
-            # LLM 2: Groq for fast conversational response
-            self.groq_llm = self.model_loader.load_llm()  # Loads Groq from config
-            logger.info("[DOCUMENT WORKFLOW] Groq loaded for response generation")
-            
-            # Embeddings
-            self.embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/text-embedding-004"
-            )
-            
-            # Setup components
+            self.groq_llm = self.model_loader.load_llm()
+
+            # ---------------------
+            # Pinecone setup
+            # ---------------------
             self._setup_pinecone()
-            self._setup_memory_manager()
-            
-            # Cache manager
+
+            # ---------------------
+            # Memory manager (STM + LTM)
+            # ---------------------
+            self._setup_memory()
+
+            # ---------------------
+            # Intent classifier
+            # ---------------------
+            self.classifier = DocumentIntentClassifier()
+
+            # ---------------------
+            # Cache
+            # ---------------------
             self.cache_manager = get_cache_manager(ttl_seconds=1800)
-            
+
+            # ---------------------
             # Prompts
-            self._setup_gemini_prompt()
-            self._setup_groq_prompt()
-            self._setup_summary_chain()
-            
+            # ---------------------
+            self._setup_prompts()
+            self._setup_summary_prompt()
+
             self.graph = None
-            
-            logger.info("[DOCUMENT WORKFLOW] Two-LLM initialization complete")
-            
+            logger.info("[WORKFLOW] Document workflow initialized successfully")
+
         except Exception as e:
-            logger.error(f"[DOCUMENT WORKFLOW] Initialization failed: {e}")
-            raise WorkflowException(
-                "Failed to initialize document workflow",
-                sys,
-                component="initialization"
-            )
-    
+            logger.error(f"[INIT ERR] {e}")
+            raise WorkflowException("Document workflow initialization failed", sys)
+
+
+    # ============================================================
+    # PINECONE INIT
+    # ============================================================
+
     def _setup_pinecone(self):
-        """Setup Pinecone vector store"""
         try:
-            pinecone_api_key = os.getenv('PINECONE_API_KEY')
-            if not pinecone_api_key:
-                raise ValueError("PINECONE_API_KEY not found in environment")
-            
-            self.pc = Pinecone(api_key=pinecone_api_key)
+            key = os.getenv("PINECONE_API_KEY")
+            if not key:
+                raise ValueError("Missing PINECONE_API_KEY")
+
+            self.pc = Pinecone(api_key=key)
             self.index = self.pc.Index("trading-bot")
-            
-            logger.info("[DOCUMENT WORKFLOW] Pinecone connected successfully")
-            
+
+            logger.info("[PINECONE] Connected OK")
+
         except Exception as e:
-            logger.error(f"[PINECONE] Setup failed: {e}")
-            raise VectorStoreException(
-                "Failed to setup Pinecone",
-                sys,
-                service="pinecone"
-            )
-    
-    def _setup_memory_manager(self):
-        """Setup hybrid memory manager (Redis + Weaviate)"""
+            logger.error(f"[PINECONE ERROR] {e}")
+            raise VectorStoreException("Failed to initialize Pinecone", sys)
+
+
+    # ============================================================
+    # MEMORY INIT
+    # ============================================================
+
+    def _setup_memory(self):
         try:
             self.memory_manager = HybridMemoryManager(
-                redis_host=os.getenv('REDIS_HOST', 'localhost'),
-                redis_port=int(os.getenv('REDIS_PORT', 6380)),
-                weaviate_url=os.getenv('WEAVIATE_URL', 'http://localhost:8080'),
-                weaviate_api_key=os.getenv('WEAVIATE_API_KEY'),
-                session_ttl_hours=48
+                redis_host=os.getenv("REDIS_HOST", "localhost"),
+                redis_port=int(os.getenv("REDIS_PORT", 6380)),
+                weaviate_url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
+                weaviate_api_key=os.getenv("WEAVIATE_API_KEY"),
             )
-            logger.info("[MEMORY] Hybrid memory manager initialized (Redis + Weaviate)")
-            
+            logger.info("[MEMORY] HybridMemoryManager ready")
+
         except Exception as e:
-            logger.error(f"[MEMORY] Setup failed: {e}")
-            raise WorkflowException(
-                "Failed to setup memory manager",
-                sys,
-                component="memory_manager"
-            )
-    
-    def _setup_gemini_prompt(self):
-        """Setup Gemini Flash prompt for multimodal analysis"""
-        self.gemini_system_prompt = """You are a **Multimodal Document Analyzer** powered by Gemini Flash.
+            logger.error(f"[MEMORY INIT ERROR] {e}")
+            raise
 
-**YOUR TASK:**
-Analyze the provided document chunks (text, tables, or charts) and extract precise information to answer the user's query.
 
-**ANALYSIS INSTRUCTIONS:**
+    # ============================================================
+    # PROMPTS
+    # ============================================================
 
-1. **For TEXT chunks:**
-   - Extract relevant sentences and paragraphs
-   - Preserve exact quotes when important
-   - Note the page number
+    def _setup_prompts(self):
 
-2. **For TABLE chunks:**
-   - Parse the table structure carefully
-   - Extract specific data points requested
-   - Understand relationships between columns/rows
-   - Note: Table ID and Page Number
+        # ---------------- GENIMI PROMPT ----------------
+        self.gemini_prompt = """
+You are Gemini 2.5 Flash Lite.
+Analyze ONLY the retrieved document chunks.
+Extract:
+ - Key facts
+ - Definitions
+ - Numerical values
+ - Table or chart meaning
+ - Important relationships
+NEVER hallucinate.
+"""
 
-3. **For CHART chunks:**
-   - Analyze chart descriptions and data
-   - Extract trends, values, and insights
-   - Note: Chart ID and Page Number
+        # ---------------- GROQ PROMPT ----------------
+        # Citations included
+        self.groq_prompt = """
+You are Groq (Qwen-32B). You produce the FINAL document-grounded answer.
 
-**OUTPUT FORMAT:**
-Return a structured analysis in this format:
+RULES:
+1. Use Gemini analysis as authoritative.
+2. Use ONLY the retrieved chunks — do not hallucinate.
+3. Cite sources using:
+     (Page X), (Table T1), (Chart C3), (Image I2)
+4. If the document does NOT contain the answer, say:
+     "The document does not provide information about this."
 
-```
-ANALYSIS:
-[Your detailed analysis here]
+CONVERSATION HISTORY:
+{history}
 
-EXTRACTED DATA:
-- [Key point 1 from source X]
-- [Key point 2 from source Y]
-...
+GEMINI ANALYSIS:
+{analysis}
 
-SOURCES USED:
-- Page X (Text)
-- Table T1 on Page Y
-- Chart C2 on Page Z
-```
-
-**CRITICAL RULES:**
-- Use ONLY the provided chunks - no external knowledge
-- Be precise with numbers and data
-- Clearly cite sources for each claim
-- If information is missing, state it explicitly
-
----
-
-**USER QUERY:**
-{query}
-
-**RETRIEVED CHUNKS:**
+DOCUMENT CHUNKS:
 {chunks}
-"""
-    
-    def _setup_groq_prompt(self):
-        """Setup Groq prompt for conversational response"""
-        self.groq_system_prompt = """You are a **Professional Document Assistant** powered by Groq for fast, accurate responses.
 
-**YOUR ROLE:**
-Generate a natural, conversational response based on the multimodal analysis provided by our document analyzer.
-
-**RESPONSE GUIDELINES:**
-
-1. **Conversational Tone:** Write naturally, as if explaining to a colleague
-2. **Source Citation:** ALWAYS cite sources using this format:
-   - Tables: "According to Table T1 on Page 3, ..."
-   - Charts: "As shown in Chart C2 on Page 5, ..."
-   - Text: "Based on Page 2, ..."
-3. **Accuracy:** Use exact data from the analysis
-4. **Clarity:** Structure your response logically with proper formatting
-5. **Completeness:** Answer the full query comprehensively
-
-**CONVERSATION CONTEXT:**
-{conversation_history}
-
-**PREVIOUS INTERACTIONS WITH THIS DOCUMENT:**
-{long_term_context}
-
-**MULTIMODAL ANALYSIS:**
-{gemini_analysis}
-
-**USER QUERY:**
+USER QUESTION:
 {query}
-
-**INSTRUCTIONS:**
-- Synthesize the analysis into a clear, helpful response
-- Cite ALL sources for factual claims
-- Use bullet points or numbering for clarity when appropriate
-- If the analysis indicates missing information, acknowledge it
 """
-    
-    def _setup_summary_chain(self):
-        """Setup summarization chain for LTM"""
-        try:
-            summary_prompt = PromptTemplate.from_template(
-                """Summarize this document conversation concisely (under 100 words):
-                
-                Current Summary: {current_summary}
-                New Messages: {new_messages}
-                
-                Focus on:
-                - Key questions asked
-                - Main topics discussed
-                - Important findings from the document
-                
-                Return ONLY the updated summary.
+
+
+    # ============================================================
+    # SUMMARY PROMPT (STM + LTM)
+    # ============================================================
+
+    def _setup_summary_prompt(self):
+        from langchain_core.prompts import PromptTemplate
+
+        self.summary_chain = (
+            PromptTemplate.from_template(
                 """
-            )
-            self.summary_chain = summary_prompt | self.groq_llm#LLMChain(llm=self.groq_llm, prompt=summary_prompt)
-            logger.info("[SUMMARY] Chain initialized with Groq")
-            
-        except Exception as e:
-            logger.error(f"[SUMMARY] Setup failed: {e}")
-            raise WorkflowException(
-                "Failed to setup summary chain",
-                sys,
-                component="summary_chain"
-            )
-    
+You update a rolling summary of a document conversation (<100 words).
+
+Current Summary:
+{current_summary}
+
+Recent Messages:
+{new_messages}
+
+Return ONLY the updated summary.
+"""
+            ) | self.groq_llm
+        )
+
+
+    # ============================================================
+    # RETRIEVAL NODE
+    # ============================================================
+
     @log_execution_time
-    def _retrieval_node(self, state: DocumentState) -> DocumentState:
-        """
-        Node 1: Retrieve relevant chunks from Pinecone
-        """
+    def _retrieval_node(self, state: DocumentState):
+
         try:
-            messages = state["messages"]
-            doc_id = state.get("doc_id", "")
-            
-            last_message = messages[-1] if messages else None
-            
-            if not last_message or not hasattr(last_message, 'content'):
-                logger.warning("[RETRIEVAL] No valid message found")
-                return state
-            
-            query = last_message.content
-            logger.info(f"[RETRIEVAL] Doc: {doc_id} | Query: {query[:50]}...")
-            
-            # Create vector store with doc_id filter
-            vector_store = PineconeVectorStore(
+            query = state["messages"][-1].content
+            doc_id = state["doc_id"]
+
+            logger.info(f"[RETRIEVAL] doc_id={doc_id} | query='{query}'")
+
+            embed = self.model_loader.load_embeddings_vertex()
+
+            vs = PineconeVectorStore(
                 index=self.index,
-                embedding=self.embeddings,
+                embedding=embed,
                 namespace="documents"
             )
-            
-            # Retrieve top-k similar chunks
-            results = vector_store.similarity_search(
+
+            # 🔥 NEW: Get chunks WITH similarity score
+            results = vs.similarity_search_with_score(
                 query=query,
-                k=5,
+                k=10,
                 filter={"doc_id": doc_id}
             )
-            
+
             chunks = []
             sources = []
-            
-            for doc in results:
+
+            for i, (doc, score) in enumerate(results):
+                meta = doc.metadata or {}
+
                 chunks.append({
-                    'content': doc.page_content,
-                    'metadata': doc.metadata,
-                    'type': doc.metadata.get('type', 'text')
+                    "content": doc.page_content,
+                    "metadata": meta,
+                    "score": float(score),     # 🔥 store score
+                    "type": meta.get("type", "text")
                 })
-                
-                # Extract source information
-                metadata = doc.metadata
-                if metadata.get('type') == 'table':
-                    sources.append({
-                        'type': 'table',
-                        'page': metadata.get('page_num'),
-                        'table_id': metadata.get('table_id'),
-                        'table_name': metadata.get('table_name', f"Table {metadata.get('table_id')}")
-                    })
-                elif metadata.get('type') == 'chart':
-                    sources.append({
-                        'type': 'chart',
-                        'page': metadata.get('page_num'),
-                        'chart_id': metadata.get('chart_id'),
-                        'chart_name': metadata.get('chart_name', f"Chart {metadata.get('chart_id')}")
-                    })
-                elif metadata.get('page_num'):
-                    sources.append({
-                        'type': 'text',
-                        'page': metadata.get('page_num')
-                    })
-            
-            logger.info(f"[RETRIEVAL] Retrieved {len(chunks)} chunks | Sources: {len(sources)}")
-            
-            return {
-                **state,
-                "retrieved_chunks": chunks,
-                "sources": sources
-            }
-            
+
+                sources.append({
+                    "type": meta.get("type", "text"),
+                    "page": meta.get("page_num"),
+                    "id": meta.get("table_id") or meta.get("chart_id")
+                })
+
+            return {**state, "retrieved_chunks": chunks, "sources": sources}
+
         except Exception as e:
-            logger.error(f"[RETRIEVAL] Error: {e}")
-            raise VectorStoreException(
-                "Retrieval failed",
-                sys,
-                doc_id=doc_id,
-                query=query[:100] if 'query' in locals() else "empty"
-            )
-    
+            logger.error(f"[RETRIEVAL ERR] {e}")
+            return state
+
+
+    # ============================================================
+    # GEMINI ANALYSIS NODE
+    # ============================================================
+
     @log_execution_time
-    def _gemini_analysis_node(self, state: DocumentState) -> Dict:
-        """
-        Node 2: Gemini Flash analyzes multimodal content
-        """
+    def _gemini_analysis_node(self, state: DocumentState):
+
         try:
-            messages = state["messages"]
-            retrieved_chunks = state.get("retrieved_chunks", [])
-            
-            last_message = messages[-1] if messages else None
-            if not last_message:
-                return {"gemini_analysis": "No query provided"}
-            
-            query = last_message.content
-            logger.info(f"[GEMINI] Starting multimodal analysis...")
-            
-            # Check cache
-            cache_key = self.cache_manager._generate_key(
-                query, str(retrieved_chunks), prefix="gemini_analysis"
+            query = state["messages"][-1].content
+            chunks = state["retrieved_chunks"]
+
+            chunk_text = "\n\n".join(
+                f"[CHUNK {i}] Page {c['metadata'].get('page_num')}:\n{c['content']}"
+                for i, c in enumerate(chunks, 1)
             )
-            cached_analysis = self.cache_manager.get(cache_key)
-            
-            if cached_analysis:
-                logger.info("[GEMINI] Using cached analysis")
-                return {"gemini_analysis": cached_analysis}
-            
-            # Format chunks for Gemini
-            formatted_chunks = self._format_chunks_for_gemini(retrieved_chunks)
-            
-            # Build Gemini prompt
-            gemini_prompt = self.gemini_system_prompt.format(
-                query=query,
-                chunks=formatted_chunks
+
+            full_prompt = (
+                self.gemini_prompt
+                + "\nQUESTION:\n" + query
+                + "\n\nCHUNKS:\n" + chunk_text
             )
-            
-            # Invoke Gemini Flash
-            gemini_response = self.gemini_llm.invoke([
-                SystemMessage(content=gemini_prompt)
-            ])
-            
-            analysis = gemini_response.content if hasattr(gemini_response, 'content') else str(gemini_response)
-            
-            # Cache the analysis
-            self.cache_manager.set(cache_key, analysis)
-            
-            logger.info(f"[GEMINI] Analysis complete | Length: {len(analysis)} chars")
-            
-            return {"gemini_analysis": analysis}
-            
+
+            resp = self.gemini_llm.generate_content(full_prompt)
+            analysis = getattr(resp, "text", None) or "No analyzable content found."
+
+            return {**state, "gemini_analysis": analysis}
+
         except Exception as e:
-            logger.error(f"[GEMINI] Analysis failed: {e}")
-            return {"gemini_analysis": f"Analysis error: {str(e)}"}
-    
-    def _format_chunks_for_gemini(self, chunks: List[Dict]) -> str:
-        """Format retrieved chunks for Gemini analysis"""
-        formatted = []
-        
-        for i, chunk in enumerate(chunks, 1):
-            metadata = chunk['metadata']
-            content = chunk['content']
-            chunk_type = chunk.get('type', 'text')
-            
-            if chunk_type == 'table':
-                formatted.append(
-                    f"--- CHUNK {i}: TABLE ---\n"
-                    f"Table ID: {metadata.get('table_id', 'Unknown')}\n"
-                    f"Page: {metadata.get('page_num', 'Unknown')}\n"
-                    f"Content:\n{content}\n"
-                )
-            elif chunk_type == 'chart':
-                formatted.append(
-                    f"--- CHUNK {i}: CHART ---\n"
-                    f"Chart ID: {metadata.get('chart_id', 'Unknown')}\n"
-                    f"Page: {metadata.get('page_num', 'Unknown')}\n"
-                    f"Description:\n{content}\n"
-                )
-            else:
-                formatted.append(
-                    f"--- CHUNK {i}: TEXT ---\n"
-                    f"Page: {metadata.get('page_num', 'Unknown')}\n"
-                    f"Content:\n{content}\n"
-                )
-        
-        return "\n".join(formatted)
-    
+            logger.error(f"[GEMINI ERR] {e}")
+            return {**state, "gemini_analysis": "Gemini analysis unavailable."}
+
+
+    # ============================================================
+    # GROQ ANSWER NODE (final answer generator)
+    # ============================================================
+
     @log_execution_time
-    def _groq_response_node(self, state: DocumentState) -> Dict:
-        """
-        Node 3: Groq generates conversational response with citations.
-        - Uses STM history (Redis)
-        - Uses LTM context (Weaviate)
-        - Stores final Q&A into Weaviate DocumentQA
-        """
+    def _groq_response_node(self, state: DocumentState):
+
         try:
-            messages = state["messages"]
-            user_id = state.get("user_id", "anonymous")
-            doc_id = state.get("doc_id", "")
-            gemini_analysis = state.get("gemini_analysis", "No analysis available")
+            doc_id = state["doc_id"]
+            query = state["messages"][-1].content.lower()
 
-            last_message = messages[-1] if messages else None
-            if not last_message:
-                return {"messages": [AIMessage(content="No query provided.")]}
+            # -------------------------------
+            # 1) Get STM conversation history
+            # -------------------------------
+            history_events = self.memory_manager.get_short_term_memory(doc_id, limit=5)
+            history_text = ""
+            for m in history_events:
+                history_text += f"{m['role'].upper()}: {m['content']}\n"
 
-            query = last_message.content
-            logger.info(f"[GROQ] Generating conversational response…")
+            # -------------------------------
+            # 2) Smart Ranking of chunks
+            # -------------------------------
+            chunks = state.get("retrieved_chunks", [])
 
-            # =====================================================
-            # CACHE CHECK
-            # =====================================================
-            cache_key = self.cache_manager._generate_key(
-                doc_id, query, gemini_analysis[:120], prefix="groq_response"
-            )
-            cached = self.cache_manager.get(cache_key)
-            if cached:
-                logger.info("[GROQ] Using cached response")
-                return {"messages": [cached]}
+            def score_chunk(c):
+                base = c.get("score", 1.0)
 
-            # =====================================================
-            # STM HISTORY (Redis) - last 3 messages
-            # =====================================================
-            redis_history = self.memory_manager.get_short_term_memory(doc_id, limit=5)
-            conversation_history = "\n".join([
-                f"{type(m).__name__}: {m.content[:150]}…"
-                for m in redis_history[-3:]
-            ]) or "No previous conversation"
+                bonus = 0
 
-            # =====================================================
-            # LTM CONTEXT (Weaviate DocumentQA)
-            # =====================================================
-            long_term_context = self._get_document_ltm(doc_id, user_id)
+                # Priority 1 — tables & charts
+                if c["type"] == "table":
+                    bonus += 0.5
+                if c["type"] == "chart":
+                    bonus += 0.4
 
-            # =====================================================
-            # Build Groq final prompt
-            # =====================================================
-            groq_prompt = self.groq_system_prompt.format(
-                conversation_history=conversation_history,
-                long_term_context=long_term_context,
-                gemini_analysis=gemini_analysis,
-                query=query
-            )
+                # Priority 2 — keyword match in content
+                content = c.get("content", "").lower()
+                for word in query.split():
+                    if word in content:
+                        bonus += 0.2
 
-            # =====================================================
-            # CALL GROQ (PRIMARY LLM)
-            # =====================================================
-            groq_response = self.groq_llm.invoke([
-                SystemMessage(content=groq_prompt)
-            ])
+                return base + bonus
 
-            # Extract text cleanly
-            final_text = (
-                groq_response.content
-                if hasattr(groq_response, "content")
-                else str(groq_response)
-            ).strip()
+            ranked = sorted(chunks, key=score_chunk, reverse=True)
 
-            # Wrap into AIMessage (required by LangGraph)
-            final_message = AIMessage(content=final_text)
+            # Keep only top 3 chunks
+            top_chunks = ranked[:3]
 
-            # =====================================================
-            # WRITE TO STM (Redis)
-            # =====================================================
-            self.memory_manager.store_message(
-                doc_id,               # STM key
-                "assistant",          # role
-                final_text            # content
+            # Build compact chunk text
+            compact_chunks = "\n\n".join(
+                f"[CHUNK {i}] (score={c.get('score'):.4f}) Page {c['metadata'].get('page_num')}:\n"
+                f"{c['content'][:1500]}..."
+                for i, c in enumerate(top_chunks, 1)
             )
 
-            # =====================================================
-            # WRITE TO LTM (Weaviate DocumentQA)
-            # =====================================================
-            try:
-                self.memory_manager.weaviate_manager.store_document_qa(
-                    doc_id=doc_id,
-                    user_id=user_id,
-                    question=query,
-                    answer=final_text,
-                    sources=state.get("sources", [])
-                )
-                logger.info(f"[LTM] Q&A stored for doc={doc_id}")
-            except Exception as e:
-                logger.error(f"[LTM ERROR] Failed to store Q&A: {e}")
+            # -------------------------------
+            # 3) Trim Gemini analysis
+            # -------------------------------
+            gemini_analysis = state["gemini_analysis"]
+            if len(gemini_analysis) > 2000:
+                gemini_analysis = gemini_analysis[:2000] + "..."
 
-            # =====================================================
-            # ADD TO CACHE
-            # =====================================================
-            self.cache_manager.set(cache_key, final_message)
+            # -------------------------------
+            # 4) Build Groq final prompt
+            # -------------------------------
+            prompt = self.groq_prompt.format(
+                history=history_text,
+                analysis=gemini_analysis,
+                query=state["messages"][-1].content,
+                chunks=compact_chunks
+            )
 
-            logger.info(f"[GROQ] Response OK | {len(final_text)} chars")
+            result = self.groq_llm.invoke([SystemMessage(content=prompt)])
+            final_text = result.content if hasattr(result, "content") else str(result)
 
-            return {"messages": [final_message]}
+            final_msg = AIMessage(content=final_text.strip())
+
+            # -------------------------------
+            # 5) Save assistant reply to STM
+            # -------------------------------
+            self.memory_manager.store_message(doc_id, "assistant", final_msg.content)
+
+            return {"messages": [final_msg], "sources": state["sources"]}
 
         except Exception as e:
-            logger.error(f"[GROQ RESPONSE ERROR] {e}")
-            return {
-                "messages": [
-                    AIMessage(content="I encountered an error generating the response.")
-                ]
-            }
+            logger.error(f"[GROQ ERR] {e}")
+            return {"messages": [AIMessage(content="Error generating document answer.")]}
 
-    
-    def _get_document_ltm(self, doc_id: str, user_id: str) -> str:
-        """Retrieve long-term memory for document"""
-        try:
-            collection = self.memory_manager.weaviate_manager.client.collections.get("DocumentQA")
-            
-            from weaviate.classes.query import Filter
-            response = collection.query.fetch_objects(
-                filters=Filter.by_property("doc_id").equal(doc_id),
-                limit=5
-            )
-            
-            if response.objects:
-                context = "Previous Q&A about this document:\n"
-                for item in response.objects:
-                    q = item.properties.get('question', '')[:60]
-                    a = item.properties.get('answer', '')[:120]
-                    context += f"Q: {q}...\nA: {a}...\n\n"
-                return context
-        except Exception as e:
-            logger.warning(f"[LTM] Could not retrieve context: {e}")
-        
-        return "No previous interactions with this document."
-    
+
+        # ============================================================
+    # SUMMARY NODE  (Writes STM + LTM)
+    # ============================================================
+
     @log_execution_time
-    def _summarization_node(self, state: DocumentState) -> Dict:
-        """
-        Node 4: Summarize recent conversation and update LTM (Weaviate).
-        Also updates rolling summary in STM (Redis).
-        """
+    def _summarizer_node(self, state: DocumentState):
+
         try:
-            messages = state["messages"]
-            user_id = state.get("user_id", "anonymous")
-            doc_id = state.get("doc_id", "")
+            doc_id = state["doc_id"]
 
-            # current summary (from STM)
-            current_summary = state.get("summary", "New document conversation")
+            # Last few exchanges
+            msgs = state["messages"]
+            last_msgs = [
+                m for m in msgs if isinstance(m, (HumanMessage, AIMessage))
+            ][-4:]
 
-            # extract only true conversational messages
-            conversational_messages = [
-                m for m in messages
-                if isinstance(m, (HumanMessage, AIMessage))
-            ]
+            formatted = "\n".join(
+                f"{type(m).__name__}: {m.content}" for m in last_msgs
+            )
 
-            # nothing to summarize
-            if not conversational_messages:
-                return state
+            # Current summary from STM (Redis)
+            current_summary = self.memory_manager.get_summary(doc_id) or ""
 
-            # last 5 messages for incremental summarization
-            new_messages = conversational_messages[-5:]
-            formatted = "\n".join([
-                f"{type(m).__name__}: {m.content[:200]}"
-                for m in new_messages
-            ])
-
-            # ================================
-            # Run summarizer LLM
-            # ================================
-            new_summary_result = self.summary_chain.invoke({
+            # Run summary chain (Groq)
+            resp = self.summary_chain.invoke({
                 "current_summary": current_summary,
                 "new_messages": formatted
             })
 
-            if hasattr(new_summary_result, "content"):
-                new_summary = new_summary_result.content.strip()
-            else:
-                new_summary = str(new_summary_result).strip()
+            new_summary = resp.content if hasattr(resp, "content") else str(resp)
 
-            logger.info(f"[SUMMARY] Updated summary for doc={doc_id}")
+            # -----------------------------
+            # STORE TO STM + LTM
+            # -----------------------------
+            self.memory_manager.store_summary(
+                doc_id=doc_id,
+                summary=new_summary
+            )
 
-            # ==========================================================
-            # UPDATE LTM (DocumentQA) → rolling conversation summary
-            # ==========================================================
-            try:
-                self.memory_manager.store_summary(
-                    doc_id=doc_id,
-                    summary=new_summary,
-                    topics=["summary", "document", doc_id]
-                )
-                logger.info(f"[LTM] Stored summary for {doc_id}")
-            except Exception as e:
-                logger.error(f"[LTM] Failed to store summary: {e}")
-
-            # ==========================================================
-            # For long sessions (10+ conversational messages), 
-            # We also store a Q&A snapshot to maintain deep history.
-            # ==========================================================
-            if len(conversational_messages) >= 10:
-                logger.info(f"[ARCHIVE] Saving deep summary snapshot for {doc_id}")
-                try:
-                    self.memory_manager.store_summary(
-                        doc_id=doc_id,
-                        summary=new_summary,
-                        topics=["deep", "conversation", doc_id]
-                    )
-                except Exception as e:
-                    logger.error(f"[ARCHIVE] Deep summary store failed: {e}")
-
-            # Return updated summary to workflow state
             return {"summary": new_summary}
 
         except Exception as e:
-            logger.error(f"[SUMMARY NODE ERROR] {e}")
+            logger.error(f"[SUMMARY ERR] {e}")
             return state
 
-    
+
+    # ============================================================
+    # INTENT ROUTER
+    # ============================================================
+
+    def route_intent(self, intent: str, question: str, doc_id: str, user_id: str):
+        """
+        Direct fast-path handler for:
+         - GREETING
+         - DOCUMENT_SUMMARY
+         - CONVERSATION_SUMMARY
+         - CONVERSATION_HISTORY
+         - NOT_RELATED_TO_DOCUMENT  
+         - Otherwise → run RAG workflow
+        """
+
+        # -------------------------------
+        # GREETING
+        # -------------------------------
+        if intent == "GREETING":
+            return AIMessage(content="Hello! How can I help you with this document?")
+
+        # ------------------------------------
+        # NOT RELATED TO DOCUMENT
+        # ------------------------------------
+        if intent == "NOT_RELATED_TO_DOCUMENT":
+            msg = (
+                "This question is not related to the uploaded document.\n"
+                "Please ask something that appears inside the document.\n"
+                "For external info, use the Internet Search panel."
+            )
+            return AIMessage(content=msg)
+
+        # ------------------------------------
+        # DOCUMENT SUMMARY (LTM)
+        # ------------------------------------
+        if intent == "DOCUMENT_SUMMARY":
+            summary = self.memory_manager.get_ltm_summary(doc_id)
+            if not summary:
+                summary = "No summary available yet. Ask questions about the document to build one."
+            return AIMessage(content=summary)
+
+        # ------------------------------------
+        # CONVERSATION SUMMARY (STM)
+        # ------------------------------------
+        if intent == "CONVERSATION_SUMMARY":
+            summary = self.memory_manager.get_summary(doc_id)
+            return AIMessage(content=summary or "No recent conversation summary exists.")
+
+        # ------------------------------------
+        # LAST Q&A (LTM)
+        # ------------------------------------
+        if intent == "CONVERSATION_HISTORY":
+            last = self.memory_manager.get_last_qa(doc_id, limit=3)
+            if not last:
+                return AIMessage(content="No previous document Q&A found.")
+            formatted = "\n\n".join(
+                f"Q: {item['question']}\nA: {item['answer']}" for item in last
+            )
+            return AIMessage(content=formatted)
+
+        # ------------------------------------
+        # DEFAULT → RUN FULL RAG WORKFLOW
+        # ------------------------------------
+        return None  # Signal workflow to proceed
+
+
+    # ============================================================
+    # GRAPH BUILD
+    # ============================================================
+
     def build(self):
-        """Build two-LLM workflow graph"""
         try:
-            logger.info("[DOCUMENT WORKFLOW] Building two-LLM graph...")
-            
-            graph_builder = StateGraph(DocumentState)
-            
-            # Add nodes in order
-            graph_builder.add_node("retrieval", self._retrieval_node)
-            graph_builder.add_node("gemini_analysis_node", self._gemini_analysis_node)
-            graph_builder.add_node("groq_response", self._groq_response_node)
-            graph_builder.add_node("summarizer", self._summarization_node)
-            
-            # Define workflow edges
-            graph_builder.add_edge(START, "retrieval")
-            graph_builder.add_edge("retrieval", "gemini_analysis_node")
-            graph_builder.add_edge("gemini_analysis_node", "groq_response")
-            graph_builder.add_edge("groq_response", "summarizer")
-            graph_builder.add_edge("summarizer", END)
-            
-            self.graph = graph_builder.compile()
-            
-            logger.info("[DOCUMENT WORKFLOW] Two-LLM graph built successfully")
-            
+            g = StateGraph(DocumentState)
+
+            g.add_node("retrieval", self._retrieval_node)
+            g.add_node("gemini", self._gemini_analysis_node)
+            g.add_node("groq", self._groq_response_node)
+            g.add_node("summarizer", self._summarizer_node)
+
+            g.add_edge(START, "retrieval")
+            g.add_edge("retrieval", "gemini")
+            g.add_edge("gemini", "groq")
+            g.add_edge("groq", "summarizer")
+            g.add_edge("summarizer", END)
+
+            self.graph = g.compile()
+            logger.info("[GRAPH] Document RAG workflow graph built successfully!")
+
         except Exception as e:
-            logger.error(f"[DOCUMENT WORKFLOW] Graph building failed: {e}")
-            raise WorkflowException(
-                "Failed to build workflow graph",
-                sys,
-                component="graph_builder"
-            )
-    
+            logger.error(f"[GRAPH BUILD ERROR] {e}")
+            raise WorkflowException("Graph build failed", sys)
+
+
+    # ============================================================
+    # GRAPH ACCESS
+    # ============================================================
+
     def get_graph(self):
-        """Get compiled graph"""
         if not self.graph:
-            raise WorkflowException(
-                "Graph not built. Call build() first.",
-                sys,
-                component="graph"
-            )
+            raise WorkflowException("Graph has not been built yet!", sys)
         return self.graph
-    
+
+
+    # ============================================================
+    # CACHE
+    # ============================================================
+
     def clear_cache(self):
-        """Clear all document caches"""
-        count = self.cache_manager.clear(prefix="gemini_analysis")
-        count += self.cache_manager.clear(prefix="groq_response")
-        logger.info(f"[CACHE] Cleared {count} document cache entries")
-    
-    def get_cache_stats(self) -> Dict:
-        """Get cache statistics"""
-        return self.cache_manager.get_stats()
-    
-    def close(self):
-        """Cleanup resources"""
         try:
-            logger.info("[DOCUMENT WORKFLOW] Closing connections...")
+            self.cache_manager.clear("gemini2.5")
+            self.cache_manager.clear("groq")
+        except Exception:
+            pass
+
+
+    # ============================================================
+    # CLEANUP LIFECYCLE
+    # ============================================================
+
+    def close(self):
+        """Close memory manager connections."""
+        try:
             self.memory_manager.close()
-            logger.info("[DOCUMENT WORKFLOW] Connections closed")
-        except Exception as e:
-            logger.error(f"[DOCUMENT WORKFLOW] Error during cleanup: {e}")
-
-
-# Export
-__all__ = ['DocumentRAGWorkflowBuilder']
+        except:
+            pass
